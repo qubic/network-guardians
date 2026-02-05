@@ -1,604 +1,474 @@
 #!/bin/bash
-# bob-install.sh - Qubic Bob Node installer & manager
+#
+# Bob Node Installer - Docker-based setup
+# https://github.com/qubic/core-bob
 #
 # Usage:
 #   Interactive:  ./bob-install.sh
-#   CLI:          ./bob-install.sh <mode> [options]
+#   CLI:          ./bob-install.sh install --seed <seed> --alias <alias>
 #
-# Install modes:
-#   docker              run via docker (recommended)
-#   uninstall           remove bob node completely
+# Commands:
+#   install       Install and start Bob node
+#   uninstall     Remove Bob node
+#   status        Show container status
+#   logs          Show live logs
+#   stop          Stop container
+#   start         Start container
+#   restart       Restart container
 #
-# Management modes:
-#   status              show container status
-#   logs                show live logs (Ctrl+C to exit)
-#   stop                stop containers
-#   start               start containers
-#   restart             restart containers
-#   update              pull latest image + restart
-#
-# Options:
-#   --node-seed <seed>      node identity seed (required for install)
-#   --node-alias <alias>    node alias name (required for install)
-#   --peers <ip:port,...>   peers to sync from
-#   --threads <n>           max threads (0=auto)
-#   --rpc-port <port>       REST API port (default: 40420)
-#   --server-port <port>    P2P port (default: 21842)
-#   --data-dir <path>       install dir (default: /opt/qubic-bob)
 
 set -e
 
-# resolve own path before any cd changes the working directory
-SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
-
-# defaults
-MODE=""
-PEERS=""
-BM_PEERS=""
-MAX_THREADS=0
-RPC_PORT=40420
-SERVER_PORT=21842
-DATA_DIR="/opt/qubic-bob"
+# --- Config ---
+CONTAINER_NAME="qubic-bob"
 DOCKER_IMAGE="qubiccore/bob"
-ARBITRATOR_ID="AFZPUAIYVPNUYGJRQVLUKOPPVLHAZQTGLYAAUUNBXFTVTAMSBKQBLEIEPCVJ"
-NODE_SEED=""
-NODE_ALIAS=""
+DATA_DIR="/opt/qubic-bob"
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
+# Default ports
+P2P_PORT=21842
+API_PORT=40420
 
-log_info()  { echo -e "${CYAN}[*]${NC} $1"; }
+# --- Colors ---
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+log_info()  { echo -e "${BLUE}[*]${NC} $1"; }
 log_ok()    { echo -e "${GREEN}[+]${NC} $1"; }
 log_warn()  { echo -e "${YELLOW}[!]${NC} $1"; }
 log_error() { echo -e "${RED}[-]${NC} $1"; }
 
-validate_node_params() {
-    # Validate NODE_SEED and NODE_ALIAS don't contain characters that break JSON
-    local param_name="$1"
-    local param_value="$2"
-
-    if [ -z "$param_value" ]; then
-        return 0
-    fi
-
-    # Check for quotes and backslashes that would break JSON
-    case "$param_value" in
-        *'"'*|*\\*)
-            log_error "${param_name} contains invalid characters (quotes or backslashes)"
-            exit 1
-            ;;
-    esac
-}
+# --- Functions ---
 
 print_usage() {
+    echo "Bob Node Installer"
+    echo ""
     echo "Usage:"
     echo "  Interactive:  $0"
-    echo "  CLI:          $0 <mode> --node-seed <seed> --node-alias <alias> [options]"
+    echo "  CLI:          $0 <command> [options]"
     echo ""
-    echo "Modes (install):"
-    echo "  docker              run via docker (recommended)"
-    echo "  uninstall           remove bob node completely"
+    echo "Commands:"
+    echo "  install       Install and start Bob node"
+    echo "  uninstall     Remove Bob node and data"
+    echo "  status        Show container status"
+    echo "  info          Show node info (tick, epoch, identity)"
+    echo "  logs          Show live logs (Ctrl+C to exit)"
+    echo "  stop          Stop container"
+    echo "  start         Start container"
+    echo "  restart       Restart container"
     echo ""
-    echo "Modes (manage):"
-    echo "  status              show container status"
-    echo "  logs                show live logs (Ctrl+C to exit)"
-    echo "  stop                stop containers"
-    echo "  start               start containers"
-    echo "  restart             restart containers"
-    echo "  update              pull latest image + restart"
+    echo "Install options:"
+    echo "  --seed <seed>       Node seed (55 lowercase letters) [REQUIRED]"
+    echo "  --alias <alias>     Node alias name [REQUIRED]"
+    echo "  --p2p-port <port>   P2P port (default: 21842)"
+    echo "  --api-port <port>   API port (default: 40420)"
+    echo "  --data-dir <path>   Data directory (default: /opt/qubic-bob)"
     echo ""
-    echo "Options:"
-    echo "  --node-seed <seed>     node identity seed (REQUIRED for install)"
-    echo "  --node-alias <alias>   node alias name (REQUIRED for install)"
-    echo "  --peers <ip:port,...>  peers to sync from"
-    echo "  --threads <n>          max threads (0=auto)"
-    echo "  --rpc-port <port>      REST API port (default: 40420)"
-    echo "  --server-port <port>   P2P port (default: 21842)"
-    echo "  --data-dir <path>      install dir (default: /opt/qubic-bob)"
-    echo ""
-    echo "Security note:"
-    echo "  Prefix CLI commands with a space to prevent seed from being saved in bash history:"
-    echo "    [space]$0 docker --node-seed <seed> --node-alias <alias>"
+    echo "Examples:"
+    echo "  $0 install --seed abcde...xyz --alias mynode"
+    echo "  $0 logs"
+    echo "  $0 status"
 }
 
-check_root() {
-    if [ "$EUID" -ne 0 ]; then
-        log_error "run as root"
-        exit 1
-    fi
+print_security_warning() {
+    echo ""
+    log_warn "SECURITY TIP: To prevent your seed from being saved in shell history:"
+    echo "      - Add a SPACE before the command:  ' ./bob-install.sh install ...'"
+    echo "      - Or use interactive mode:  ./bob-install.sh"
+    echo "      - Or set: export HISTCONTROL=ignorespace"
+    echo ""
 }
 
-check_system() {
-    log_info "checking system..."
-
-    if [ ! -f /etc/os-release ]; then
-        log_error "needs Ubuntu/Debian"
-        exit 1
-    fi
-
-    local ram_kb ram_gb cores avail_gb
-    ram_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
-    ram_gb=$((ram_kb / 1024 / 1024))
-    cores=$(nproc)
-    avail_gb=$(df -BG / | tail -1 | awk '{print $4}' | tr -d 'G')
-
-    [ "$ram_gb" -lt 14 ] && log_warn "RAM: ${ram_gb}GB (need 16GB)" || log_ok "RAM: ${ram_gb}GB"
-    [ "$cores" -lt 4 ] && log_warn "CPU: ${cores} cores (need 4)" || log_ok "CPU: ${cores} cores"
-    grep -q avx2 /proc/cpuinfo && log_ok "AVX2: yes" || log_warn "AVX2: not detected"
-    [ "$avail_gb" -lt 100 ] && log_warn "Disk: ${avail_gb}GB (need 100GB)" || log_ok "Disk: ${avail_gb}GB"
-}
-
-# --- peer discovery ---
-
-PEER_LIST_URL="https://app.qubic.li/network/live"
-
-fetch_default_peers() {
-    # fetch peers from qubic.global API when none provided
-    if [ -n "$PEERS" ]; then
-        # user provided manual peers - parse them into BM category
-        parse_manual_peers
-        return
-    fi
-    log_info "fetching peers from qubic.global API..."
-    local resp
-    resp=$(curl -sSf --max-time 10 "https://api.qubic.global/random-peers?service=bobNode&litePeers=6" 2>/dev/null) || {
-        log_error "could not reach qubic.global API"
-        log_warn "please provide peers manually with --peers or select from:"
-        log_warn "  ${PEER_LIST_URL}"
-        log_warn ""
-        log_warn "example: --peers 1.2.3.4,5.6.7.8"
-        exit 1
-    }
-
-    # Extract litePeers (these become BM/trusted-node peers)
-    # Extract bobPeers (these provide actual tick data)
-    local api_lite_peers api_bob_peers
-
-    if command -v jq &> /dev/null; then
-        # Use jq for reliable JSON parsing
-        api_lite_peers=$(echo "$resp" | jq -r '.litePeers[]? // empty' 2>/dev/null || true)
-        api_bob_peers=$(echo "$resp" | jq -r '.bobPeers[]? // empty' 2>/dev/null || true)
-    else
-        # Fallback to grep (less reliable but avoids jq dependency)
-        api_lite_peers=$(echo "$resp" | grep -oP '"litePeers"\s*:\s*\[([^\]]*)\]' | grep -oP '"[^"]+\.\d+"' | tr -d '"' || true)
-        api_bob_peers=$(echo "$resp" | grep -oP '"bobPeers"\s*:\s*\[([^\]]*)\]' | grep -oP '"[^"]+\.\d+"' | tr -d '"' || true)
-    fi
-
-    # Build peer lists
-    BM_PEERS=""
-    for ip in $api_lite_peers; do BM_PEERS="${BM_PEERS:+$BM_PEERS,}BM:${ip}:21841:0-0-0-0"; done
-
-    BOB_PEERS=""
-    for ip in $api_bob_peers; do BOB_PEERS="${BOB_PEERS:+$BOB_PEERS,}bob:${ip}:21842"; done
-
-    if [ -z "$BM_PEERS" ] && [ -z "$BOB_PEERS" ]; then
-        log_error "API returned no peers"
-        log_warn "please provide peers manually with --peers or select from:"
-        log_warn "  ${PEER_LIST_URL}"
-        exit 1
-    fi
-
-    [ -n "$BM_PEERS" ] && log_ok "peers (BM): ${BM_PEERS}"
-    [ -n "$BOB_PEERS" ] && log_ok "peers (bob): ${BOB_PEERS}"
-}
-
-parse_manual_peers() {
-    # Parse user-provided PEERS string into BM and bob peers
-    # Supports formats:
-    #   BM:ip:port:pass        -> BM peer as-is
-    #   BM:ip:port             -> BM peer, add :0-0-0-0 suffix
-    #   bob:ip:port            -> bob peer as-is
-    #   bob:ip                 -> bob peer, add :21842 port
-    #   ip:port                -> BM peer, add BM: prefix and :0-0-0-0 suffix
-    #   ip                     -> BM peer, add BM: prefix, :21841 port, and :0-0-0-0 suffix
-    BM_PEERS=""
-    BOB_PEERS=""
-    local IFS=','
-    for peer in $PEERS; do
-        peer=$(echo "$peer" | xargs)  # trim whitespace
-        if [[ "$peer" == BM:* ]]; then
-            # BM peer
-            if [[ "$peer" =~ ^BM:[0-9.]+:[0-9]+:[0-9-]+$ ]]; then
-                BM_PEERS="${BM_PEERS:+$BM_PEERS,}$peer"
-            elif [[ "$peer" =~ ^BM:[0-9.]+:[0-9]+$ ]]; then
-                BM_PEERS="${BM_PEERS:+$BM_PEERS,}${peer}:0-0-0-0"
-            else
-                log_warn "skipping invalid BM peer format: $peer"
-            fi
-        elif [[ "$peer" == bob:* ]]; then
-            # bob peer
-            if [[ "$peer" =~ ^bob:[0-9.]+:[0-9]+$ ]]; then
-                BOB_PEERS="${BOB_PEERS:+$BOB_PEERS,}$peer"
-            elif [[ "$peer" =~ ^bob:[0-9.]+$ ]]; then
-                local ip="${peer#bob:}"
-                BOB_PEERS="${BOB_PEERS:+$BOB_PEERS,}bob:${ip}:21842"
-            else
-                log_warn "skipping invalid bob peer format: $peer"
-            fi
-        elif [[ "$peer" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+$ ]]; then
-            # ip:port format -> add BM: prefix and passcode
-            BM_PEERS="${BM_PEERS:+$BM_PEERS,}BM:${peer}:0-0-0-0"
-        elif [[ "$peer" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            # ip only -> add BM: prefix, default port, and passcode
-            BM_PEERS="${BM_PEERS:+$BM_PEERS,}BM:${peer}:21841:0-0-0-0"
-        else
-            log_warn "skipping invalid peer format: $peer"
+check_docker() {
+    if ! command -v docker &> /dev/null; then
+        log_warn "Docker not found. Installing..."
+        curl -fsSL https://get.docker.com | sh
+        if ! command -v docker &> /dev/null; then
+            log_error "Docker installation failed"
+            exit 1
         fi
-    done
+        log_ok "Docker installed"
+    fi
+    log_ok "Docker: $(docker --version | cut -d' ' -f3 | tr -d ',')"
+}
 
-    if [ -z "$BM_PEERS" ] && [ -z "$BOB_PEERS" ]; then
-        log_error "no valid peers found in: $PEERS"
-        log_warn "please provide valid peer IPs, e.g.: --peers 1.2.3.4,5.6.7.8"
-        log_warn "find peers at: ${PEER_LIST_URL}"
+container_exists() {
+    docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"
+}
+
+container_running() {
+    docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"
+}
+
+do_install() {
+    log_info "Installing Bob node..."
+
+    check_docker
+
+    # Validate inputs
+    if [ -z "$NODE_SEED" ]; then
+        log_error "--seed is required"
         exit 1
     fi
 
-    [ -n "$BM_PEERS" ] && log_ok "peers (BM): ${BM_PEERS}"
-    [ -n "$BOB_PEERS" ] && log_ok "peers (bob): ${BOB_PEERS}"
-}
-
-# --- config generation ---
-
-generate_config() {
-    local keydb_host="$1" kvrocks_host="$2" config_path="$3"
-
-    # Combine BM and bob peers for trusted-node
-    local all_peers=""
-    [ -n "$BM_PEERS" ] && all_peers="$BM_PEERS"
-    [ -n "$BOB_PEERS" ] && all_peers="${all_peers:+$all_peers,}$BOB_PEERS"
-
-    # Build JSON array for trusted-node
-    local trusted_json="[]"
-    if [ -n "$all_peers" ]; then
-        trusted_json=$(echo "$all_peers" | tr ',' '\n' | awk '{printf "\"%s\",", $0}' | sed 's/,$//' | awk '{print "["$0"]"}')
+    if [ ${#NODE_SEED} -ne 55 ]; then
+        log_warn "Seed should be 55 characters (got ${#NODE_SEED})"
     fi
 
-    cat > "$config_path" <<CONFIGEOF
-{
-  "p2p-node": [],
-  "trusted-node": ${trusted_json},
-  "request-cycle-ms": 100,
-  "request-logging-cycle-ms": 30,
-  "future-offset": 3,
-  "log-level": "info",
-  "keydb-url": "tcp://${keydb_host}:6379",
-  "run-server": true,
-  "server-port": ${SERVER_PORT},
-  "rpc-port": ${RPC_PORT},
-  "arbitrator-identity": "${ARBITRATOR_ID}",
-  "tick-storage-mode": "kvrocks",
-  "kvrocks-url": "tcp://${kvrocks_host}:6666",
-  "tx-storage-mode": "kvrocks",
-  "tx_tick_to_live": 10000,
-  "max-thread": ${MAX_THREADS},
-  "spam-qu-threshold": 100,
-  "node-seed": "${NODE_SEED}",
-  "node-alias": "${NODE_ALIAS}"
-}
-CONFIGEOF
+    if [ -z "$NODE_ALIAS" ]; then
+        log_error "--alias is required"
+        exit 1
+    fi
 
-    log_ok "config -> ${config_path}"
-}
+    # Stop existing containers
+    if container_exists; then
+        log_info "Removing existing container..."
+        docker rm -f "$CONTAINER_NAME" &>/dev/null || true
+    fi
+    docker rm -f watchtower &>/dev/null || true
 
-# --- docker install ---
+    # Create directory
+    mkdir -p "${DATA_DIR}"
 
-install_docker() {
-    log_info "setting up bob node..."
+    # Copy script for management
+    cp "$0" "${DATA_DIR}/bob-install.sh" 2>/dev/null || true
+    chmod +x "${DATA_DIR}/bob-install.sh" 2>/dev/null || true
 
-    install_docker_engine
-    mkdir -p "${DATA_DIR}/data" && cd "${DATA_DIR}"
+    # Pull image
+    log_info "Pulling image from Docker Hub..."
+    docker pull "${DOCKER_IMAGE}:latest"
+    log_ok "Image ready"
 
-    fetch_default_peers
-    generate_config "127.0.0.1" "127.0.0.1" "${DATA_DIR}/bob.json"
+    # Create .env file with sensitive data
+    cat > "${DATA_DIR}/.env" <<EOF
+NODE_SEED=${NODE_SEED}
+NODE_ALIAS=${NODE_ALIAS}
+EOF
+    chmod 600 "${DATA_DIR}/.env"
+    log_ok "Config: ${DATA_DIR}/.env"
 
-    cat > "${DATA_DIR}/docker-compose.yml" <<COMPOSEEOF
+    # Create docker-compose.yml
+    cat > "${DATA_DIR}/docker-compose.yml" <<EOF
 services:
   qubic-bob:
     image: ${DOCKER_IMAGE}:latest
+    container_name: ${CONTAINER_NAME}
     restart: unless-stopped
     ports:
-      - "21842:21842"
-      - "40420:40420"
+      - "${P2P_PORT}:21842"
+      - "${API_PORT}:40420"
+    env_file:
+      - .env
     volumes:
-      - ./bob.json:/app/bob.json:ro
       - qubic-bob-redis:/data/redis
       - qubic-bob-kvrocks:/data/kvrocks
-      - ./data:/data/bob
+      - qubic-bob-data:/data/bob
+
+  watchtower:
+    image: containrrr/watchtower
+    container_name: watchtower
+    restart: unless-stopped
+    environment:
+      DOCKER_API_VERSION: "1.44"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: --interval 300 ${CONTAINER_NAME}
 
 volumes:
   qubic-bob-redis:
   qubic-bob-kvrocks:
-COMPOSEEOF
+  qubic-bob-data:
+EOF
 
-    sed -i "s/\"21842:21842\"/\"${SERVER_PORT}:21842\"/" "${DATA_DIR}/docker-compose.yml"
-    sed -i "s/\"40420:40420\"/\"${RPC_PORT}:40420\"/" "${DATA_DIR}/docker-compose.yml"
+    # Start containers
+    log_info "Starting containers..."
+    cd "${DATA_DIR}" && docker compose up -d
 
-    log_info "starting containers..."
-    docker compose up -d
-
-    log_ok "done!"
-    print_status_docker
-}
-
-# --- component installers ---
-
-install_docker_engine() {
-    if command -v docker &> /dev/null; then
-        log_ok "docker: $(docker --version)"
-    else
-        log_info "installing docker..."
-        curl -fsSL https://get.docker.com | sh
-        systemctl enable docker && systemctl start docker
-        log_ok "docker installed"
-    fi
-}
-
-# --- status output ---
-
-print_status_docker() {
+    log_ok "Bob node started!"
     echo ""
-    echo -e "${GREEN}--- bob node ready ---${NC}"
-    echo "  dir:     ${DATA_DIR}"
-    echo "  config:  ${DATA_DIR}/bob.json"
-    echo "  P2P:     ${SERVER_PORT}"
-    echo "  API:     http://localhost:${RPC_PORT}"
+    echo "  Container:   $CONTAINER_NAME"
+    echo "  Config:      ${DATA_DIR}/.env"
+    echo "  P2P:         port ${P2P_PORT}"
+    echo "  API:         http://localhost:${API_PORT}"
+    echo "  Auto-Update: enabled (Watchtower)"
     echo ""
-    echo "  docker compose -f ${DATA_DIR}/docker-compose.yml ps       # status"
-    echo "  docker compose -f ${DATA_DIR}/docker-compose.yml logs -f  # logs"
-    echo "  docker compose -f ${DATA_DIR}/docker-compose.yml restart  # restart"
+    echo "  View logs:   ./bob-install.sh logs"
+    echo "  Status:      ./bob-install.sh status"
     echo ""
-}
 
-# --- uninstall ---
+    cd "${DATA_DIR}"
+}
 
 do_uninstall() {
-    log_info "uninstalling bob node..."
+    log_info "Uninstalling Bob node..."
 
-    # stop and remove docker containers
+    # Stop containers
     if [ -f "${DATA_DIR}/docker-compose.yml" ]; then
-        log_info "stopping docker containers..."
         docker compose -f "${DATA_DIR}/docker-compose.yml" down -v 2>/dev/null || true
-        log_ok "containers stopped and volumes removed"
+        log_ok "Containers stopped"
+    elif container_exists; then
+        docker rm -f "$CONTAINER_NAME" &>/dev/null || true
+        docker rm -f watchtower &>/dev/null || true
+        log_ok "Containers removed"
     fi
 
-    # stop systemd service if exists
-    if systemctl is-active --quiet qubic-bob 2>/dev/null; then
-        log_info "stopping systemd service..."
-        systemctl stop qubic-bob
-        systemctl disable qubic-bob
-        rm -f /etc/systemd/system/qubic-bob.service
-        systemctl daemon-reload
-        log_ok "service removed"
-    fi
-
-    # remove install directory
-    if [ -d "${DATA_DIR}" ]; then
-        log_info "removing ${DATA_DIR}..."
-        rm -rf "${DATA_DIR}"
-        log_ok "directory removed"
-    fi
-
-    echo ""
-    log_ok "bob node uninstalled"
-}
-
-# --- management commands ---
-
-check_installed() {
-    if [ ! -f "${DATA_DIR}/docker-compose.yml" ]; then
-        log_error "bob node not installed in ${DATA_DIR}"
-        log_info "run '$0 docker' to install"
-        exit 1
-    fi
-}
-
-cmd_status() {
-    check_installed
-    echo ""
-    log_info "container status:"
-    docker compose -f "${DATA_DIR}/docker-compose.yml" ps
-    echo ""
-    log_info "checking API..."
-    local api_response
-    api_response=$(curl -sf --max-time 5 "http://localhost:${RPC_PORT}/status" 2>/dev/null) && {
-        echo "$api_response" | head -c 500
+    # Ask before removing data
+    local data_removed=false
+    if [ -d "$DATA_DIR" ]; then
         echo ""
-    } || log_warn "API not responding on port ${RPC_PORT}"
+        read -rp "Remove data directory ${DATA_DIR}? [y/N] " confirm
+        if [[ "$confirm" =~ ^[Yy]$ ]]; then
+            rm -rf "$DATA_DIR"
+            log_ok "Data removed"
+            data_removed=true
+        else
+            log_info "Data kept at ${DATA_DIR}"
+        fi
+    fi
+
+    log_ok "Uninstall complete"
+
+    # Return to home if data dir was removed
+    if [ "$data_removed" = true ]; then
+        cd ~ && exec bash
+    fi
 }
 
-cmd_logs() {
-    check_installed
-    log_info "showing live logs (Ctrl+C to exit)..."
-    docker compose -f "${DATA_DIR}/docker-compose.yml" logs -f
+do_status() {
+    if container_running; then
+        log_ok "Bob node is running"
+        echo ""
+        docker ps --filter "name=${CONTAINER_NAME}" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+        docker ps --filter "name=watchtower" --format "table {{.Names}}\t{{.Status}}" 2>/dev/null || true
+        echo ""
+        log_info "Checking API endpoint..."
+        local response
+        response=$(curl -sf --max-time 5 "http://localhost:${API_PORT}/status" 2>/dev/null || true)
+        if [ -n "$response" ]; then
+            echo "$response" | head -c 500
+            echo ""
+        else
+            log_warn "API not responding on port ${API_PORT}"
+        fi
+    elif container_exists; then
+        log_warn "Bob node is stopped"
+        docker ps -a --filter "name=${CONTAINER_NAME}" --format "table {{.Names}}\t{{.Status}}"
+    else
+        log_info "Bob node is not installed"
+    fi
 }
 
-cmd_stop() {
-    check_installed
-    log_info "stopping containers..."
-    docker compose -f "${DATA_DIR}/docker-compose.yml" stop
-    log_ok "containers stopped"
-}
+do_info() {
+    if ! container_running; then
+        log_error "Bob node is not running"
+        return 1
+    fi
 
-cmd_start() {
-    check_installed
-    log_info "starting containers..."
-    docker compose -f "${DATA_DIR}/docker-compose.yml" start
-    log_ok "containers started"
-}
+    log_info "Fetching node info..."
+    local response
+    response=$(curl -sf --max-time 10 "http://localhost:${API_PORT}/status" 2>/dev/null || true)
 
-cmd_restart() {
-    check_installed
-    log_info "restarting containers..."
-    docker compose -f "${DATA_DIR}/docker-compose.yml" restart
-    log_ok "containers restarted"
-}
-
-cmd_update() {
-    check_installed
-    log_info "pulling latest images..."
-    docker compose -f "${DATA_DIR}/docker-compose.yml" pull
-    log_info "restarting containers..."
-    docker compose -f "${DATA_DIR}/docker-compose.yml" up -d
-    log_ok "update complete"
-}
-
-# --- interactive setup ---
-
-interactive_setup() {
-    echo -e "${CYAN}┌─────────────────────────────────────────────────┐${NC}"
-    echo -e "${CYAN}│${NC}  ${GREEN}INSTALL${NC}                                        ${CYAN}│${NC}"
-    echo -e "${CYAN}│${NC}    1) docker       install via docker           ${CYAN}│${NC}"
-    echo -e "${CYAN}│${NC}    2) uninstall    remove bob node              ${CYAN}│${NC}"
-    echo -e "${CYAN}├─────────────────────────────────────────────────┤${NC}"
-    echo -e "${CYAN}│${NC}  ${GREEN}MANAGE${NC}                                         ${CYAN}│${NC}"
-    echo -e "${CYAN}│${NC}    3) status    4) logs      5) stop            ${CYAN}│${NC}"
-    echo -e "${CYAN}│${NC}    6) start     7) restart   8) update          ${CYAN}│${NC}"
-    echo -e "${CYAN}└─────────────────────────────────────────────────┘${NC}"
-    echo ""
-    while true; do
-        read -rp "  Select [1-8]: " choice
-        case "$choice" in
-            1) MODE="docker";    break ;;
-            2) MODE="uninstall"; break ;;
-            3) MODE="status";    break ;;
-            4) MODE="logs";      break ;;
-            5) MODE="stop";      break ;;
-            6) MODE="start";     break ;;
-            7) MODE="restart";   break ;;
-            8) MODE="update";    break ;;
-            *) echo -e "  ${RED}Invalid choice. Please enter 1-8.${NC}" ;;
-        esac
-    done
-
-    # skip seed/alias prompts for uninstall and management commands
-    if [ "$MODE" = "uninstall" ] || [ "$MODE" = "status" ] || [ "$MODE" = "logs" ] || \
-       [ "$MODE" = "stop" ] || [ "$MODE" = "start" ] || [ "$MODE" = "restart" ] || [ "$MODE" = "update" ]; then
-        return
+    if [ -z "$response" ]; then
+        log_error "Could not fetch status from port ${API_PORT}"
+        return 1
     fi
 
     echo ""
-    echo -e "${CYAN}┌─────────────────────────────────────────────────┐${NC}"
-    echo -e "${CYAN}│${NC}  ${GREEN}NODE CONFIGURATION${NC}                             ${CYAN}│${NC}"
-    echo -e "${CYAN}└─────────────────────────────────────────────────┘${NC}"
+    echo -e "${GREEN}=== Bob Node Info ===${NC}"
     echo ""
-    echo -e "  ${YELLOW}Tip: Interactive mode is safer than CLI for entering seeds.${NC}"
+
+    local epoch tick alias operator version uptime
+    epoch=$(echo "$response" | grep -oP '"currentProcessingEpoch":\K[0-9]+')
+    tick=$(echo "$response" | grep -oP '"currentFetchingTick":\K[0-9]+')
+    alias=$(echo "$response" | grep -oP '"alias":"[^"]*"' | cut -d'"' -f4)
+    operator=$(echo "$response" | grep -oP '"operator":"[^"]*"' | cut -d'"' -f4)
+    version=$(echo "$response" | grep -oP '"bobVersion":\s*"[^"]*"' | cut -d'"' -f4)
+    uptime=$(echo "$response" | grep -oP '"uptime":\K[0-9]+')
+
+    [ -n "$alias" ] && echo -e "  Alias:     ${CYAN}${alias}${NC}"
+    [ -n "$operator" ] && echo -e "  Operator:  ${CYAN}${operator}${NC}"
+    [ -n "$epoch" ] && echo -e "  Epoch:     ${epoch}"
+    [ -n "$tick" ] && echo -e "  Tick:      ${tick}"
+    [ -n "$version" ] && echo -e "  Version:   ${version}"
+    [ -n "$uptime" ] && echo -e "  Uptime:    ${uptime}s"
     echo ""
+
+    log_info "Raw response:"
+    echo "$response" | head -c 1000
+    echo ""
+}
+
+do_logs() {
+    if ! container_exists; then
+        log_error "Container not found"
+        return 1
+    fi
+    log_info "Showing logs (Ctrl+C to exit)..."
+    docker logs -f "$CONTAINER_NAME"
+}
+
+do_stop() {
+    if container_running; then
+        docker stop "$CONTAINER_NAME"
+        log_ok "Stopped"
+    else
+        log_info "Already stopped"
+    fi
+}
+
+do_start() {
+    if container_running; then
+        log_info "Already running"
+        return
+    fi
+
+    if [ -f "${DATA_DIR}/docker-compose.yml" ]; then
+        cd "${DATA_DIR}" && docker compose up -d
+        log_ok "Started"
+    elif container_exists; then
+        docker start "$CONTAINER_NAME"
+        log_ok "Started"
+    else
+        log_error "Container not found. Run: $0 install"
+        return 1
+    fi
+}
+
+do_restart() {
+    if [ -f "${DATA_DIR}/docker-compose.yml" ]; then
+        cd "${DATA_DIR}" && docker compose up -d --force-recreate
+        log_ok "Restarted"
+    elif container_exists; then
+        docker restart "$CONTAINER_NAME"
+        log_ok "Restarted"
+    else
+        log_error "Container not found. Run: $0 install"
+        return 1
+    fi
+}
+
+interactive_install() {
+    echo ""
+    echo "=== Bob Node Installer ==="
+    echo ""
+
+    print_security_warning
+
+    # Get seed
     while [ -z "$NODE_SEED" ]; do
-        read -rp "  Node seed: " NODE_SEED
-        # Strip surrounding quotes and whitespace from pasted input
-        NODE_SEED=$(echo "$NODE_SEED" | sed "s/^[[:space:]]*[\"']*//; s/[\"']*[[:space:]]*$//")
-        [ -z "$NODE_SEED" ] && echo -e "  ${RED}Node seed is required.${NC}"
+        read -rp "Node seed (55 characters): " NODE_SEED
+        if [ -z "$NODE_SEED" ]; then
+            echo "  Seed is required."
+        elif [ ${#NODE_SEED} -ne 55 ]; then
+            log_warn "Seed should be 55 characters (got ${#NODE_SEED})"
+            read -rp "  Continue anyway? [y/N] " confirm
+            [[ ! "$confirm" =~ ^[Yy]$ ]] && NODE_SEED=""
+        fi
     done
 
+    # Get alias
     while [ -z "$NODE_ALIAS" ]; do
-        read -rp "  Node alias: " NODE_ALIAS
-        # Strip surrounding quotes and whitespace from pasted input
-        NODE_ALIAS=$(echo "$NODE_ALIAS" | sed "s/^[[:space:]]*[\"']*//; s/[\"']*[[:space:]]*$//")
-        [ -z "$NODE_ALIAS" ] && echo -e "  ${RED}Node alias is required.${NC}"
+        read -rp "Node alias: " NODE_ALIAS
+        [ -z "$NODE_ALIAS" ] && echo "  Alias is required."
     done
 
     echo ""
-    read -rp "  Peers (ip:port, comma-separated, Enter=auto): " PEERS
+    do_install
+}
 
+print_logo() {
     echo ""
-    read -rp "  Max threads (Enter=auto): " input_threads
-    if [ -n "$input_threads" ]; then
-        MAX_THREADS="$input_threads"
-    fi
+    echo -e "${CYAN}              @@@@@@ @@@@@@${NC}"
+    echo -e "${CYAN}              @@@@@@ @@@@@@${NC}"
+    echo -e "${CYAN}              @@@@@@ @@@@@@${NC}"
+    echo -e "${CYAN}              @@@@@@ @@@@@@${NC}"
+    echo -e "${CYAN}              @@@@@@ @@@@@@${NC}"
+    echo -e "${CYAN}              @@@@@@ @@@@@@${NC}"
+    echo -e "${CYAN}              @@@@@@ @@@@@@${NC}"
+    echo -e "${CYAN}                     @@@@@@${NC}"
+    echo -e "${CYAN}                     @@@@@@${NC}"
+    echo ""
+    echo -e "${GREEN}      Qubic Bob Node Installer${NC}"
+    echo -e "      ────────────────────────────"
     echo ""
 }
 
-# --- arg parsing ---
+interactive_menu() {
+    set +e  # Disable exit on error for interactive mode
+    while true; do
+        echo ""
+        print_logo
 
-parse_args() {
-    if [ $# -eq 0 ]; then
-        interactive_setup
-        return
-    fi
+        echo -e "${CYAN}┌─────────────────────────────────────────────────┐${NC}"
+        echo -e "${CYAN}│${NC}  ${GREEN}INSTALL${NC}                                        ${CYAN}│${NC}"
+        echo -e "${CYAN}│${NC}    1) install      setup bob node               ${CYAN}│${NC}"
+        echo -e "${CYAN}│${NC}    2) uninstall    remove bob node              ${CYAN}│${NC}"
+        echo -e "${CYAN}├─────────────────────────────────────────────────┤${NC}"
+        echo -e "${CYAN}│${NC}  ${GREEN}MANAGE${NC}                                         ${CYAN}│${NC}"
+        echo -e "${CYAN}│${NC}    3) status    4) info      5) logs            ${CYAN}│${NC}"
+        echo -e "${CYAN}│${NC}    6) stop      7) start     8) restart         ${CYAN}│${NC}"
+        echo -e "${CYAN}├─────────────────────────────────────────────────┤${NC}"
+        echo -e "${CYAN}│${NC}    0) exit                                      ${CYAN}│${NC}"
+        echo -e "${CYAN}└─────────────────────────────────────────────────┘${NC}"
+        echo ""
+        read -rp "  Select [0-8]: " choice
 
-    MODE="$1"; shift
-
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            --peers)       PEERS="$2";       shift 2 ;;
-            --threads)     MAX_THREADS="$2"; shift 2 ;;
-            --rpc-port)    RPC_PORT="$2";    shift 2 ;;
-            --server-port) SERVER_PORT="$2"; shift 2 ;;
-            --data-dir)    DATA_DIR="$2";    shift 2 ;;
-            --node-seed)   NODE_SEED="$2";   shift 2 ;;
-            --node-alias)  NODE_ALIAS="$2";  shift 2 ;;
-            --help|-h)     print_usage;      exit 0  ;;
-            *) log_error "unknown option: $1"; print_usage; exit 1 ;;
+        case "$choice" in
+            0) echo ""; log_info "Goodbye!"; exit 0 ;;
+            1) interactive_install || true ;;
+            2) do_uninstall || true ;;
+            3) do_status || true ;;
+            4) do_info || true ;;
+            5) do_logs || true ;;
+            6) do_stop || true ;;
+            7) do_start || true ;;
+            8) do_restart || true ;;
+            *) log_error "Invalid choice" ;;
         esac
+
+        echo ""
+        read -rp "  Press Enter to continue..." _
     done
 }
 
-# --- main ---
+# --- Main ---
 
-print_banner() {
-    echo ""
-    echo -e "${CYAN}              @@@@@@ @@@@@@${NC}"
-    echo -e "${CYAN}              @@@@@@ @@@@@@${NC}"
-    echo -e "${CYAN}              @@@@@@ @@@@@@${NC}"
-    echo -e "${CYAN}              @@@@@@ @@@@@@${NC}"
-    echo -e "${CYAN}              @@@@@@ @@@@@@${NC}"
-    echo -e "${CYAN}              @@@@@@ @@@@@@${NC}"
-    echo -e "${CYAN}              @@@@@@ @@@@@@${NC}"
-    echo -e "${CYAN}                     @@@@@@${NC}"
-    echo -e "${CYAN}                     @@@@@@${NC}"
-    echo ""
-    echo -e "${GREEN}       Qubic Bob Node Installer${NC}"
-    echo -e "       ─────────────────────────"
-    echo ""
-}
+NODE_SEED=""
+NODE_ALIAS=""
 
-main() {
-    print_banner
-    parse_args "$@"
-    check_root
+# Parse arguments
+if [ $# -eq 0 ]; then
+    interactive_menu
+    exit 0
+fi
 
-    # handle uninstall separately
-    if [ "$MODE" = "uninstall" ]; then
-        do_uninstall
-        exit 0
-    fi
+COMMAND="$1"
+shift
 
-    # handle management commands (no seed/system check needed)
-    case "$MODE" in
-        status)  cmd_status;  exit 0 ;;
-        logs)    cmd_logs;    exit 0 ;;
-        stop)    cmd_stop;    exit 0 ;;
-        start)   cmd_start;   exit 0 ;;
-        restart) cmd_restart; exit 0 ;;
-        update)  cmd_update;  exit 0 ;;
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --seed)      NODE_SEED="$2"; shift 2 ;;
+        --alias)     NODE_ALIAS="$2"; shift 2 ;;
+        --p2p-port)  P2P_PORT="$2"; shift 2 ;;
+        --api-port)  API_PORT="$2"; shift 2 ;;
+        --data-dir)  DATA_DIR="$2"; shift 2 ;;
+        --help|-h)   print_usage; exit 0 ;;
+        *)           log_error "Unknown option: $1"; print_usage; exit 1 ;;
     esac
+done
 
-    if [ -z "$NODE_SEED" ]; then
-        log_error "--node-seed is required. Bob cannot start without a node seed."
-        print_usage
-        exit 1
-    fi
-    validate_node_params "node-seed" "$NODE_SEED"
-
-    if [ -z "$NODE_ALIAS" ]; then
-        log_error "--node-alias is required. Bob cannot start without a node alias."
-        print_usage
-        exit 1
-    fi
-    validate_node_params "node-alias" "$NODE_ALIAS"
-
-    check_system
-
-    case "$MODE" in
-        docker) install_docker ;;
-        *) log_error "unknown mode: ${MODE}"; print_usage; exit 1 ;;
-    esac
-
-    # copy script to install directory for future management
-    if [ -f "$SELF" ] && [ "$SELF" != "${DATA_DIR}/bob-install.sh" ]; then
-        cp "$SELF" "${DATA_DIR}/bob-install.sh"
-        chmod +x "${DATA_DIR}/bob-install.sh"
-        log_ok "script copied to ${DATA_DIR}/bob-install.sh"
-    fi
-}
-
-main "$@"
+case "$COMMAND" in
+    install)    do_install ;;
+    uninstall)  do_uninstall ;;
+    status)     do_status ;;
+    info)       do_info ;;
+    logs)       do_logs ;;
+    stop)       do_stop ;;
+    start)      do_start ;;
+    restart)    do_restart ;;
+    help|--help|-h) print_usage ;;
+    *)          log_error "Unknown command: $COMMAND"; print_usage; exit 1 ;;
+esac
