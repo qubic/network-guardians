@@ -178,12 +178,6 @@ Your Reward = (Your Reward Points / Total Pool Reward Points) × Pool Amount
 
 ---
 
-## Long Term Vision
-
-Transition the system to a fully on-chain model using a smart contract funded reward pool. Network statistics would be delivered through OM and used for automated reward distribution.
-
----
-
 ## FAQ
 
 **How do I check if my node is being monitored?**
@@ -208,7 +202,16 @@ During the 1-hour grace period (Wednesday 12:00-13:00 UTC), no checks are perfor
 
 **My node is online but has low uptime score. Why?**
 
-Failed checks count against your uptime. Common causes: firewall blocking the checker ports (Bob: 40420, Lite: 41841), node too slow, or response timeouts.
+Failed checks count against your uptime. Common causes: firewall blocking required ports, node too slow, or response timeouts.
+
+**Which ports need to be open?**
+
+| Node | Port | Protocol | Purpose |
+|------|------|----------|---------|
+| **Lite** | 21841 | P2P | Primary check port — Requests and validates tick data and quorum votes for current ticks to verify correctness |
+| **Lite** | 41841 | HTTP API | Health check endpoint |
+| **Bob** | 40420 | HTTP API | Health check endpoint |
+| **Bob** | 21842 | P2P | Must be open — Query meaningful data here as proof of operation |
 
 ---
 
@@ -225,4 +228,3 @@ Need help? Join the Qubic Discord: [discord.gg/G8qxTddTec](https://discord.gg/G8
 | Guardians Dashboard | [guardians.qubic.org](https://guardians.qubic.org/nodes) |
 | Bob Node | [GitHub](https://github.com/qubic/core-bob) |
 | Lite Node | [GitHub](https://github.com/qubic/core-lite) |
-| Epoch Data | [storage.qubic.li](https://storage.qubic.li/network/) |
