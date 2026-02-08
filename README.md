@@ -134,8 +134,8 @@ Measures how often your node responds successfully to health checks.
 ### Sync Score (40% weight)
 ```
 If node_tick >= reference_tick: Score = 100
-If ticks_behind <= 100: Score = 100  (buffer zone)
-If ticks_behind > 100: Score = 100 - ((ticks_behind - 100) × 0.15)
+If ticks_behind <= 50: Score = 100  (buffer zone)
+If ticks_behind > 50: Score = 100 - ((ticks_behind - 50) × 0.15)
 ```
 Measures how well-synchronized your node is with the network. Nodes within 100 ticks of the reference receive full marks.
 
