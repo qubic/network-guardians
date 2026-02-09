@@ -32,7 +32,7 @@ Before installing a node, you need an operator seed (your node's identity). Crea
 ### Install Bob Node
 
 ```bash
-wget -O bob-install.sh https://raw.githubusercontent.com/qubic/network-guardians/main/scripts/bob-install.sh && chmod +x bob-install.sh && ./bob-install.sh
+wget -O bob-install.sh https://raw.githubusercontent.com/qubic/network-guardians/main/scripts/bob.sh && chmod +x bob-install.sh && ./bob.sh
 ```
 
 The script prompts for:
@@ -40,21 +40,21 @@ The script prompts for:
 - **Node alias** - Display name for your node
 - **Peers** - Auto-fetched if left empty
 
-Manage your node by running `/opt/qubic-bob/bob-install.sh` without arguments to enter interactive mode, or use CLI commands:
+Manage your node by running `/opt/qubic-bob/bob.sh` without arguments to enter interactive mode, or use CLI commands:
 ```bash
-/opt/qubic-bob/bob-install.sh status    # Container status
-/opt/qubic-bob/bob-install.sh logs      # Live logs
-/opt/qubic-bob/bob-install.sh start     # Start node
-/opt/qubic-bob/bob-install.sh stop      # Stop node
-/opt/qubic-bob/bob-install.sh restart   # Restart node
-/opt/qubic-bob/bob-install.sh update    # Pull latest & restart
-/opt/qubic-bob/bob-install.sh uninstall # Remove node
+cd /opt/qubic-bob
+./bob.sh status     # show status
+./bob.sh logs       # view logs
+./bob.sh stop       # stop node
+./bob.sh start      # start node
+./bob.sh restart    # restart node
+./bob.sh uninstall  # remove node
 ```
 
 ### Install Lite Node
 
 ```bash
-wget -O lite-install.sh https://raw.githubusercontent.com/qubic/network-guardians/main/scripts/lite-install.sh && chmod +x lite-install.sh && ./lite-install.sh
+wget -O lite-install.sh https://raw.githubusercontent.com/qubic/network-guardians/main/scripts/lite.sh && chmod +x lite.sh && ./lite.sh
 ```
 
 The script prompts for:
@@ -65,13 +65,13 @@ The script prompts for:
 
 Manage your node by running `/opt/qubic-lite/lite-install.sh` without arguments to enter interactive mode, or use CLI commands:
 ```bash
-/opt/qubic-lite/lite-install.sh status    # Container status
-/opt/qubic-lite/lite-install.sh logs      # Live logs
-/opt/qubic-lite/lite-install.sh start     # Start node
-/opt/qubic-lite/lite-install.sh stop      # Stop node
-/opt/qubic-lite/lite-install.sh restart   # Restart node
-/opt/qubic-lite/lite-install.sh update    # Rebuild & restart
-/opt/qubic-lite/lite-install.sh uninstall # Remove node
+cd /opt/qubic-lite
+./lite.sh status    # show status
+./lite.sh logs      # view logs
+./lite.sh stop      # stop node
+./lite.sh start     # start node
+./lite.sh restart   # restart node
+./lite.sh uninstall # remove node
 ```
 
 For detailed installation options and troubleshooting, see [scripts/README.md](scripts/README.md).
