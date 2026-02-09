@@ -1,173 +1,197 @@
-# Qubic Node Installers
+# Network Guard
 
-Setup scripts for [Bob Node](https://github.com/qubic/core-bob) and [Lite Node](https://github.com/qubic/core-lite) on the Qubic network.
+Setup scripts for running [Bob Node](https://github.com/qubic/core-bob) and [Lite Node](https://github.com/qubic/core-lite) on the Qubic network.
 
-| Node | Description |
-|------|-------------|
-| **Bob** | Tickchain indexer |
-| **Lite** | Lightweight Qubic Core for Linux (no UEFI needed) |
+## Table of Contents
+
+**Bob Node**
+
+1. [Requirements](#requirements)
+2. [Quick Start](#quick-start)
+3. [Management](#management)
+4. [Ports](#ports)
+5. [Cloud Provider Examples](#cloud-provider-examples)
+6. [Firewall](#firewall)
+7. [Troubleshooting](#troubleshooting)
+
+**Lite Node**
+
+8. [Requirements](#requirements-1)
+9. [Quick Start](#quick-start-1)
+10. [Management](#management-1)
+11. [Ports](#ports-1)
+12. [Cloud Provider Examples](#cloud-provider-examples-1)
+13. [Firewall](#firewall-1)
+14. [Troubleshooting](#troubleshooting-1)
+
+**General**
+
+15. [Links](#links)
 
 ---
 
-## Bob Node
+# Bob Node
 
-### Requirements
+Blockchain indexer with REST API for the Qubic network.
+
+## Requirements
 
 | Component | Minimum |
 |-----------|---------|
 | RAM | 16 GB |
-| CPU | 4+ threads (AVX2) |
+| CPU | 4+ cores |
 | Disk | 100 GB SSD |
+| Docker | Required |
 
-### Install
-
-```bash
-wget -O bob-install.sh https://raw.githubusercontent.com/qubic/network-guardians/main/scripts/bob-install.sh && chmod +x bob-install.sh && ./bob-install.sh
-```
-
-The script will prompt for:
-- Node seed
-- Node alias
-- Peers (auto-fetched if left empty)
-
-### CLI Mode
+## Quick Start
 
 ```bash
-./bob-install.sh docker --node-seed YOUR_SEED --node-alias YOUR_ALIAS
+wget -O bob.sh https://raw.githubusercontent.com/Pomm3sgab3l/Network_Guard/main/scripts/bob.sh
+chmod +x bob.sh && ./bob.sh
 ```
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--node-seed` | required | Node identity seed |
-| `--node-alias` | required | Node alias name |
-| `--peers` | auto | Peer IPs (ip:port,ip:port) |
-| `--threads` | 0 (auto) | Max threads |
-| `--rpc-port` | 40420 | REST API port |
-| `--server-port` | 21842 | P2P port |
-| `--data-dir` | /opt/qubic-bob | Install directory |
+The script provides an interactive menu and stores data in `/opt/qubic-bob`.
 
-### Management
+## Management
 
 ```bash
-/opt/qubic-bob/bob-install.sh status    # container status
-/opt/qubic-bob/bob-install.sh logs      # live logs
-/opt/qubic-bob/bob-install.sh stop      # stop
-/opt/qubic-bob/bob-install.sh start     # start
-/opt/qubic-bob/bob-install.sh restart   # restart
-/opt/qubic-bob/bob-install.sh update    # pull latest + restart
+cd /opt/qubic-bob
+./bob.sh status     # show status
+./bob.sh logs       # view logs
+./bob.sh stop       # stop node
+./bob.sh start      # start node
+./bob.sh restart    # restart node
+./bob.sh uninstall  # remove node
 ```
 
-### Uninstall
+> **Auto-Update:** Watchtower automatically updates the node when new versions are released.
+
+## Ports
+
+| Port | Protocol | Description |
+|------|----------|-------------|
+| 21842 | TCP | P2P (required) |
+| 40420 | TCP | REST API |
+
+## Cloud Provider Examples
+
+The following providers have been tested with Bob Node:
+
+- Hetzner Cloud
+- Netcup / Hostkey
+- OVH / Bare Metal
+- AWS EC2
+- Google Cloud
+- DigitalOcean
+
+> **Note:** These are examples only. We do not guarantee that any provider permits running blockchain nodes. Please check the provider's terms of service before deploying.
+
+### Cloud-Init
+
+Deploy with a single command using [cloud-init](cloud-init/).
+
+## Firewall
 
 ```bash
-/opt/qubic-bob/bob-install.sh uninstall
+# UFW (Ubuntu)
+sudo ufw allow 22/tcp      # SSH
+sudo ufw allow 21842/tcp   # P2P
+sudo ufw allow 40420/tcp   # API (optional)
+sudo ufw enable
 ```
-
----
-
-## Lite Node
-
-### Requirements
-
-| Component | Mainnet |
-|-----------|---------|
-| RAM | 64 GB |
-| CPU | 8+ threads AVX2/AVX512 (AMD 7950x recommended) |
-| Disk | 500 GB SSD |
-| Network | 1 Gbit/s |
-
-### Install
-
-```bash
-wget -O lite-install.sh https://raw.githubusercontent.com/qubic/network-guardians/main/scripts/lite-install.sh && chmod +x lite-install.sh && ./lite-install.sh
-```
-
-The script will prompt for:
-- Operator seed
-- Operator alias
-- Max processors (default: 8)
-- Peers (auto-fetched if left empty)
-
-### CLI Mode
-
-```bash
-./lite-install.sh docker --operator-seed YOUR_SEED --operator-alias YOUR_ALIAS
-```
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--operator-seed` | required | Operator identity seed |
-| `--operator-alias` | required | Operator alias name |
-| `--peers` | auto | Peer IPs (ip1,ip2) |
-| `--port` | 21841 | P2P port |
-| `--http-port` | 41841 | HTTP/RPC port |
-| `--data-dir` | /opt/qubic-lite | Install directory |
-| `--avx512` | off | Enable AVX-512 |
-| `--epoch` | auto | Target specific epoch |
-| `--no-epoch` | off | Skip epoch data download |
-| `--processors` | 8 | Max runtime processors |
-| `--threads` | auto | Threads usage |
-
-### Management
-
-```bash
-/opt/qubic-lite/lite-install.sh status    # container status
-/opt/qubic-lite/lite-install.sh logs      # live logs
-/opt/qubic-lite/lite-install.sh stop      # stop
-/opt/qubic-lite/lite-install.sh start     # start
-/opt/qubic-lite/lite-install.sh restart   # restart
-/opt/qubic-lite/lite-install.sh update    # rebuild + restart
-```
-
-### Uninstall
-
-```bash
-/opt/qubic-lite/lite-install.sh uninstall
-```
-
----
 
 ## Troubleshooting
 
-### Bob Node
+| Problem | Solution |
+|---------|----------|
+| Container exits immediately | Check logs: `docker logs qubic-bob` |
+| Not syncing | Wait a few minutes, check logs for peer connections |
+| API not reachable | Check firewall, ensure port 40420 is open |
 
-**Container won't start or exits immediately**
+---
+
+# Lite Node
+
+Lightweight Qubic Core that runs on Linux without UEFI.
+
+## Requirements
+
+| Component | Testnet | Mainnet |
+|-----------|---------|---------|
+| RAM | 16 GB | 64 GB |
+| CPU | x86_64 | High-freq AVX2 |
+| Disk | - | 500 GB SSD |
+
+## Quick Start
+
 ```bash
-docker logs qubic-bob              # check error messages
-cat /opt/qubic-bob/bob.json        # verify config is valid JSON
+wget -O lite.sh https://raw.githubusercontent.com/Pomm3sgab3l/Network_Guard/main/scripts/lite.sh
+chmod +x lite.sh && ./lite.sh
 ```
 
-**Not syncing / no peers**
-```bash
-/opt/qubic-bob/bob-install.sh logs    # check for connection errors
-```
-Verify peers in `bob.json` are online at [app.qubic.li/network/live](https://app.qubic.li/network/live)
+The script provides an interactive menu and stores data in `/opt/qubic-lite`.
 
-**API not reachable**
-```bash
-curl http://localhost:40420/status    # test locally first
-sudo ufw status                       # check if port is blocked
-```
+## Management
 
-### Lite Node
-
-**Container won't start**
 ```bash
-docker logs qubic-lite             # check error messages
+cd /opt/qubic-lite
+./lite.sh status    # show status
+./lite.sh logs      # view logs
+./lite.sh stop      # stop node
+./lite.sh start     # start node
+./lite.sh restart   # restart node
+./lite.sh uninstall # remove node
 ```
 
-**Node stops ticking after restart**
+> **Auto-Update:** Watchtower automatically updates the node when new versions are released.
+
+## Ports
+
+| Port | Protocol | Description |
+|------|----------|-------------|
+| 21841 | TCP | P2P (required) |
+| 41841 | TCP | HTTP API |
+
+## Cloud Provider Examples
+
+The following providers have been tested with Lite Node:
+
+- Hetzner Cloud
+- Netcup / Hostkey
+- OVH / Bare Metal
+- AWS EC2
+- Google Cloud
+- DigitalOcean
+
+> **Note:** These are examples only. We do not guarantee that any provider permits running blockchain nodes. Please check the provider's terms of service before deploying.
+
+### Cloud-Init
+
+Deploy with a single command using [cloud-init](cloud-init/).
+
+## Firewall
+
 ```bash
-rm /opt/qubic-lite/data/system     # delete system file and restart
-/opt/qubic-lite/lite-install.sh restart
+# UFW (Ubuntu)
+sudo ufw allow 22/tcp      # SSH
+sudo ufw allow 21841/tcp   # P2P
+sudo ufw allow 41841/tcp   # HTTP API
+sudo ufw enable
 ```
 
-**Won't sync / stuck**
-- Verify epoch data exists in `/opt/qubic-lite/data/`
-- Check peers are online at [app.qubic.li/network/live](https://app.qubic.li/network/live)
-- Download latest epoch from [storage.qubic.li/network](https://storage.qubic.li/network/)
+## Troubleshooting
 
-**Out of memory**
-- Core lite requires 64GB RAM minimum
+| Problem | Solution |
+|---------|----------|
+| Build fails | Check if AVX2 is supported: `grep avx2 /proc/cpuinfo` |
+| Not syncing | Check logs, verify peers are connecting |
+| High CPU usage | Normal during sync |
 
+---
+
+## Links
+
+- Bob Node: [qubic/core-bob](https://github.com/qubic/core-bob) | [Docker Hub](https://hub.docker.com/r/qubiccore/bob)
+- Lite Node: [qubic/core-lite](https://github.com/qubic/core-lite) | [Docker Hub](https://hub.docker.com/r/qubiccore/lite)
+- Qubic: [Website](https://qubic.org) | [Network Dashboard](https://app.qubic.li/network/live)
 
