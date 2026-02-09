@@ -4,8 +4,8 @@
 # https://github.com/qubic/core-bob
 #
 # Usage:
-#   Interactive:  ./bob-install.sh
-#   CLI:          ./bob-install.sh install --seed <seed> --alias <alias>
+#   Interactive:  ./bob.sh
+#   CLI:          ./bob.sh install --seed <seed> --alias <alias>
 #
 # Commands:
 #   install       Install and start Bob node
@@ -15,6 +15,7 @@
 #   stop          Stop container
 #   start         Start container
 #   restart       Restart container
+#   reconfigure   Change seed/alias and restart
 #
 
 set -e
@@ -59,8 +60,9 @@ print_usage() {
     echo "  stop          Stop container"
     echo "  start         Start container"
     echo "  restart       Restart container"
+    echo "  reconfigure   Change seed/alias and restart"
     echo ""
-    echo "Install options:"
+    echo "Install/Reconfigure options:"
     echo "  --seed <seed>       Node seed (55 lowercase letters) [REQUIRED]"
     echo "  --alias <alias>     Node alias name [REQUIRED]"
     echo "  --p2p-port <port>   P2P port (default: 21842)"
@@ -76,8 +78,8 @@ print_usage() {
 print_security_warning() {
     echo ""
     log_warn "SECURITY TIP: To prevent your seed from being saved in shell history:"
-    echo "      - Add a SPACE before the command:  ' ./bob-install.sh install ...'"
-    echo "      - Or use interactive mode:  ./bob-install.sh"
+    echo "      - Add a SPACE before the command:  ' ./bob.sh install ...'"
+    echo "      - Or use interactive mode:  ./bob.sh"
     echo "      - Or set: export HISTCONTROL=ignorespace"
     echo ""
 }
@@ -128,14 +130,14 @@ do_install() {
         log_info "Removing existing container..."
         docker rm -f "$CONTAINER_NAME" &>/dev/null || true
     fi
-    docker rm -f watchtower &>/dev/null || true
+    docker rm -f watchtower-bob &>/dev/null || true
 
     # Create directory
     mkdir -p "${DATA_DIR}"
 
     # Copy script for management
-    cp "$0" "${DATA_DIR}/bob-install.sh" 2>/dev/null || true
-    chmod +x "${DATA_DIR}/bob-install.sh" 2>/dev/null || true
+    cp "$0" "${DATA_DIR}/bob.sh" 2>/dev/null || true
+    chmod +x "${DATA_DIR}/bob.sh" 2>/dev/null || true
 
     # Pull image
     log_info "Pulling image from Docker Hub..."
@@ -169,7 +171,7 @@ services:
 
   watchtower:
     image: containrrr/watchtower
-    container_name: watchtower
+    container_name: watchtower-bob
     restart: unless-stopped
     environment:
       DOCKER_API_VERSION: "1.44"
@@ -195,9 +197,17 @@ EOF
     echo "  API:         http://localhost:${API_PORT}"
     echo "  Auto-Update: enabled (Watchtower)"
     echo ""
-    echo "  View logs:   ./bob-install.sh logs"
-    echo "  Status:      ./bob-install.sh status"
+    echo "  View logs:   ./bob.sh logs"
+    echo "  Status:      ./bob.sh status"
     echo ""
+
+    # Remove original script if not in DATA_DIR
+    local script_path
+    script_path=$(realpath "$0" 2>/dev/null || echo "$0")
+    if [ "$script_path" != "${DATA_DIR}/bob.sh" ] && [ -f "$script_path" ]; then
+        rm -f "$script_path"
+        log_ok "Removed installer from download location"
+    fi
 
     cd "${DATA_DIR}"
 }
@@ -211,7 +221,7 @@ do_uninstall() {
         log_ok "Containers stopped"
     elif container_exists; then
         docker rm -f "$CONTAINER_NAME" &>/dev/null || true
-        docker rm -f watchtower &>/dev/null || true
+        docker rm -f watchtower-bob &>/dev/null || true
         log_ok "Containers removed"
     fi
 
@@ -242,7 +252,7 @@ do_status() {
         log_ok "Bob node is running"
         echo ""
         docker ps --filter "name=${CONTAINER_NAME}" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
-        docker ps --filter "name=watchtower" --format "table {{.Names}}\t{{.Status}}" 2>/dev/null || true
+        docker ps --filter "name=watchtower-bob" --format "table {{.Names}}\t{{.Status}}" 2>/dev/null || true
         echo ""
         log_info "Checking API endpoint..."
         local response
@@ -350,6 +360,49 @@ do_restart() {
     fi
 }
 
+do_reconfigure() {
+    if [ ! -f "${DATA_DIR}/.env" ]; then
+        log_error "No config found. Run install first."
+        return 1
+    fi
+
+    # Show current config
+    echo ""
+    log_info "Current config:"
+    local current_seed current_alias
+    current_seed=$(grep -oP 'NODE_SEED=\K.*' "${DATA_DIR}/.env" 2>/dev/null)
+    current_alias=$(grep -oP 'NODE_ALIAS=\K.*' "${DATA_DIR}/.env" 2>/dev/null)
+    echo "  Seed:  ${current_seed:0:8}...${current_seed: -4}"
+    echo "  Alias: ${current_alias}"
+    echo ""
+
+    # Get new values (Enter to keep current)
+    local new_seed new_alias
+    read -rp "New seed (Enter to keep current): " new_seed
+    read -rp "New alias (Enter to keep current): " new_alias
+
+    new_seed="${new_seed:-$current_seed}"
+    new_alias="${new_alias:-$current_alias}"
+
+    if [ "$new_seed" = "$current_seed" ] && [ "$new_alias" = "$current_alias" ]; then
+        log_info "No changes made"
+        return 0
+    fi
+
+    # Update .env
+    cat > "${DATA_DIR}/.env" <<EOF
+NODE_SEED=${new_seed}
+NODE_ALIAS=${new_alias}
+EOF
+    chmod 600 "${DATA_DIR}/.env"
+    log_ok "Config updated"
+
+    # Restart with volume reset
+    log_info "Restarting with fresh data..."
+    cd "${DATA_DIR}" && docker compose down -v && docker compose up -d
+    log_ok "Reconfigured and restarted!"
+}
+
 interactive_install() {
     echo ""
     echo "=== Bob Node Installer ==="
@@ -380,19 +433,19 @@ interactive_install() {
 }
 
 print_logo() {
+    echo -e "${CYAN}"
+    cat << 'EOF'
+            ██████  ██    ██ ██████  ██  ██████
+            ██    ██ ██    ██ ██   ██ ██ ██
+            ██    ██ ██    ██ ██████  ██ ██
+            ██ ▄▄ ██ ██    ██ ██   ██ ██ ██
+             ██████   ██████  ██████  ██  ██████
+                ▀▀
+EOF
+    echo -e "${NC}"
     echo ""
-    echo -e "${CYAN}              @@@@@@ @@@@@@${NC}"
-    echo -e "${CYAN}              @@@@@@ @@@@@@${NC}"
-    echo -e "${CYAN}              @@@@@@ @@@@@@${NC}"
-    echo -e "${CYAN}              @@@@@@ @@@@@@${NC}"
-    echo -e "${CYAN}              @@@@@@ @@@@@@${NC}"
-    echo -e "${CYAN}              @@@@@@ @@@@@@${NC}"
-    echo -e "${CYAN}              @@@@@@ @@@@@@${NC}"
-    echo -e "${CYAN}                     @@@@@@${NC}"
-    echo -e "${CYAN}                     @@@@@@${NC}"
-    echo ""
-    echo -e "${GREEN}      Qubic Bob Node Installer${NC}"
-    echo -e "      ────────────────────────────"
+    echo -e "                  ${GREEN}Qubic Bob Node Installer${NC}"
+    echo -e "                  ${CYAN}────────────────────────${NC}"
     echo ""
 }
 
@@ -402,19 +455,20 @@ interactive_menu() {
         echo ""
         print_logo
 
-        echo -e "${CYAN}┌─────────────────────────────────────────────────┐${NC}"
-        echo -e "${CYAN}│${NC}  ${GREEN}INSTALL${NC}                                        ${CYAN}│${NC}"
-        echo -e "${CYAN}│${NC}    1) install      setup bob node               ${CYAN}│${NC}"
-        echo -e "${CYAN}│${NC}    2) uninstall    remove bob node              ${CYAN}│${NC}"
-        echo -e "${CYAN}├─────────────────────────────────────────────────┤${NC}"
-        echo -e "${CYAN}│${NC}  ${GREEN}MANAGE${NC}                                         ${CYAN}│${NC}"
-        echo -e "${CYAN}│${NC}    3) status    4) info      5) logs            ${CYAN}│${NC}"
-        echo -e "${CYAN}│${NC}    6) stop      7) start     8) restart         ${CYAN}│${NC}"
-        echo -e "${CYAN}├─────────────────────────────────────────────────┤${NC}"
-        echo -e "${CYAN}│${NC}    0) exit                                      ${CYAN}│${NC}"
-        echo -e "${CYAN}└─────────────────────────────────────────────────┘${NC}"
+        echo -e "         ${CYAN}┌────────────────────────────────────────┐${NC}"
+        echo -e "         ${CYAN}│${NC} ${GREEN}INSTALL${NC}                                ${CYAN}│${NC}"
+        echo -e "         ${CYAN}│${NC}   1) install       setup bob node      ${CYAN}│${NC}"
+        echo -e "         ${CYAN}│${NC}   2) uninstall     remove bob node     ${CYAN}│${NC}"
+        echo -e "         ${CYAN}│${NC}                                        ${CYAN}│${NC}"
+        echo -e "         ${CYAN}│${NC} ${GREEN}MANAGE${NC}                                 ${CYAN}│${NC}"
+        echo -e "         ${CYAN}│${NC}   3) status    4) info      5) logs    ${CYAN}│${NC}"
+        echo -e "         ${CYAN}│${NC}   6) stop      7) start     8) restart ${CYAN}│${NC}"
+        echo -e "         ${CYAN}│${NC}   9) reconfigure  change seed/alias    ${CYAN}│${NC}"
+        echo -e "         ${CYAN}│${NC}                                        ${CYAN}│${NC}"
+        echo -e "         ${CYAN}│${NC}   0) exit                              ${CYAN}│${NC}"
+        echo -e "         ${CYAN}└────────────────────────────────────────┘${NC}"
         echo ""
-        read -rp "  Select [0-8]: " choice
+        read -rp "         Select [0-9]: " choice
 
         case "$choice" in
             0) echo ""; log_info "Goodbye!"; exit 0 ;;
@@ -426,11 +480,12 @@ interactive_menu() {
             6) do_stop || true ;;
             7) do_start || true ;;
             8) do_restart || true ;;
+            9) do_reconfigure || true ;;
             *) log_error "Invalid choice" ;;
         esac
 
         echo ""
-        read -rp "  Press Enter to continue..." _
+        read -rp "         Press Enter to continue..." _
     done
 }
 
@@ -468,7 +523,8 @@ case "$COMMAND" in
     logs)       do_logs ;;
     stop)       do_stop ;;
     start)      do_start ;;
-    restart)    do_restart ;;
+    restart)      do_restart ;;
+    reconfigure)  do_reconfigure ;;
     help|--help|-h) print_usage ;;
     *)          log_error "Unknown command: $COMMAND"; print_usage; exit 1 ;;
 esac
