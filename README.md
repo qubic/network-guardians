@@ -63,7 +63,7 @@ The script prompts for:
 - **Max processors** - Default: 8
 - **Peers** - Auto-fetched if left empty
 
-Manage your node by running `/opt/qubic-lite/lite-install.sh` without arguments to enter interactive mode, or use CLI commands:
+Manage your node by running `/opt/qubic-lite/lite.sh` without arguments to enter interactive mode, or use CLI commands:
 ```bash
 cd /opt/qubic-lite
 ./lite.sh status    # show status
