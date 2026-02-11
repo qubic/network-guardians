@@ -32,7 +32,7 @@ Before installing a node, you need an operator seed (your node's identity). Crea
 ### Install Bob Node
 
 ```bash
-wget -O bob-install.sh https://raw.githubusercontent.com/qubic/network-guardians/main/scripts/bob.sh && chmod +x bob.sh && ./bob.sh
+wget -O bob.sh https://raw.githubusercontent.com/qubic/network-guardians/main/scripts/bob.sh && chmod +x bob.sh && ./bob.sh
 ```
 
 The script prompts for:
@@ -54,7 +54,7 @@ cd /opt/qubic-bob
 ### Install Lite Node
 
 ```bash
-wget -O lite-install.sh https://raw.githubusercontent.com/qubic/network-guardians/main/scripts/lite.sh && chmod +x lite.sh && ./lite.sh
+wget -O lite.sh https://raw.githubusercontent.com/qubic/network-guardians/main/scripts/lite.sh && chmod +x lite.sh && ./lite.sh
 ```
 
 The script prompts for:
