@@ -46,7 +46,7 @@ Blockchain indexer with REST API for the Qubic network.
 ## Quick Start
 
 ```bash
-wget -O bob-install.sh https://raw.githubusercontent.com/qubic/network-guardians/main/scripts/bob.sh && chmod +x bob-install.sh && ./bob.sh
+wget -O bob.sh https://raw.githubusercontent.com/qubic/network-guardians/main/scripts/bob.sh && chmod +x bob.sh && ./bob.sh
 ```
 
 The script provides an interactive menu and stores data in `/opt/qubic-bob`.
@@ -124,7 +124,7 @@ Lightweight Qubic Core that runs on Linux without UEFI.
 ## Quick Start
 
 ```bash
-wget -O lite-install.sh https://raw.githubusercontent.com/qubic/network-guardians/main/scripts/lite.sh && chmod +x lite.sh && ./lite.sh
+wget -O lite.sh https://raw.githubusercontent.com/qubic/network-guardians/main/scripts/lite.sh && chmod +x lite.sh && ./lite.sh
 ```
 
 The script provides an interactive menu and stores data in `/opt/qubic-lite`.
