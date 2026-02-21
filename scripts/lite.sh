@@ -16,6 +16,8 @@
 #   start         Start container
 #   restart       Restart container
 #   reconfigure   Change seed/alias and restart
+#   reset         Wipe node data and restart fresh
+#   update        Update this script to latest version
 #
 
 set -e
@@ -28,6 +30,9 @@ DATA_DIR="/opt/qubic-lite"
 # Default ports
 P2P_PORT=21841
 HTTP_PORT=41841
+
+# Public RPC
+NETWORK_RPC="https://rpc.qubic.org/v1/tick-info"
 
 # --- Colors ---
 RED='\033[0;31m'
@@ -61,6 +66,8 @@ print_usage() {
     echo "  start         Start container"
     echo "  restart       Restart container"
     echo "  reconfigure   Change seed/alias and restart"
+    echo "  reset         Wipe node data and restart fresh"
+    echo "  update        Update this script to latest version"
     echo "  watch         Live snapshot download progress"
     echo ""
     echo "Install/Reconfigure options:"
@@ -125,6 +132,37 @@ container_exists() {
 
 container_running() {
     docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"
+}
+
+get_network_tick() {
+    local resp
+    resp=$(curl -sf --max-time 5 "$NETWORK_RPC" 2>/dev/null || true)
+    [ -n "$resp" ] && echo "$resp" | grep -oP '"tick":\K[0-9]+' | head -1
+}
+
+get_local_tick() {
+    local resp
+    resp=$(curl -sf --max-time 5 "http://localhost:${HTTP_PORT}/tick-info" 2>/dev/null || true)
+    [ -n "$resp" ] && echo "$resp" | grep -oP '"tick":\K[0-9]+'
+}
+
+format_number() {
+    printf "%'d" "$1" 2>/dev/null || echo "$1"
+}
+
+format_eta() {
+    local seconds=$1
+    if [ "$seconds" -lt 60 ]; then
+        echo "< 1 min"
+    elif [ "$seconds" -lt 3600 ]; then
+        echo "~$((seconds / 60)) min"
+    elif [ "$seconds" -lt 86400 ]; then
+        local h=$((seconds / 3600)) m=$(( (seconds % 3600) / 60 ))
+        echo "~${h}h ${m}m"
+    else
+        local d=$((seconds / 86400)) h=$(( (seconds % 86400) / 3600 ))
+        echo "~${d}d ${h}h"
+    fi
 }
 
 do_install() {
@@ -357,23 +395,85 @@ watch_snapshot_progress() {
 
 do_status() {
     if container_running; then
-        log_ok "Lite node is running"
-        echo ""
-        docker ps --filter "name=${CONTAINER_NAME}" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
-        docker ps --filter "name=watchtower-lite" --format "table {{.Names}}\t{{.Status}}" 2>/dev/null || true
-        echo ""
-        log_info "Checking HTTP endpoint..."
-        local response
-        response=$(curl -sf --max-time 5 "http://localhost:${HTTP_PORT}/tick-info" 2>/dev/null || true)
-        if [ -n "$response" ]; then
-            echo "$response" | head -c 500
+        trap 'echo ""; return 0' INT
+
+        local tick_prev=""
+        while true; do
+            clear
+            print_logo
+            log_ok "Lite node is running"
             echo ""
-        else
-            echo ""
-            if ! check_snapshot_progress; then
-                log_warn "HTTP not responding on port ${HTTP_PORT}"
+            docker ps --filter "name=${CONTAINER_NAME}" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+            docker ps --filter "name=watchtower-lite" --format "table {{.Names}}\t{{.Status}}" 2>/dev/null || true
+
+            local tick_now
+            tick_now=$(get_local_tick)
+
+            if [ -z "$tick_now" ]; then
+                echo ""
+                if ! check_snapshot_progress; then
+                    log_warn "HTTP not responding on port ${HTTP_PORT}"
+                fi
+                echo ""
+                echo -e "  ${BLUE}Refreshing every 3s... (Ctrl+C to exit)${NC}"
+                tick_prev=""
+                sleep 3
+                continue
             fi
-        fi
+
+            local net_tick
+            net_tick=$(get_network_tick)
+
+            echo ""
+            echo -e "  ${GREEN}=== Node Health ===${NC}"
+            echo ""
+
+            # Determine if ticking (compare with previous reading)
+            local ticking=false
+            if [ -n "$tick_prev" ] && [ "$tick_now" -gt "$tick_prev" ] 2>/dev/null; then
+                ticking=true
+            fi
+
+            if [ -n "$net_tick" ] && [ "$tick_now" -ge "$net_tick" ] 2>/dev/null; then
+                echo -e "  Status:    ${GREEN}● SYNCED${NC}"
+            elif [ -z "$tick_prev" ]; then
+                echo -e "  Status:    ${YELLOW}● CHECKING...${NC}"
+            elif [ "$ticking" = true ]; then
+                echo -e "  Status:    ${YELLOW}● SYNCING${NC} (ticking)"
+            else
+                echo -e "  Status:    ${RED}● NOT TICKING${NC}"
+            fi
+
+            echo -e "  Node Tick: ${CYAN}$(format_number "$tick_now")${NC}"
+
+            if [ -n "$net_tick" ]; then
+                echo -e "  Net Tick:  $(format_number "$net_tick")"
+
+                local behind=$((net_tick - tick_now))
+                if [ "$behind" -gt 0 ]; then
+                    local pct
+                    pct=$(awk "BEGIN {printf \"%.1f\", $tick_now * 100 / $net_tick}")
+                    echo -e "  Behind:    $(format_number "$behind") ticks (${pct}% synced)"
+
+                    # ETA based on measured tick rate
+                    if [ "$ticking" = true ] && [ -n "$tick_prev" ]; then
+                        local rate=$((tick_now - tick_prev))
+                        if [ "$rate" -gt 0 ]; then
+                            local eta_sec=$((behind * 3 / rate))
+                            echo -e "  ETA:       ${CYAN}$(format_eta "$eta_sec")${NC}"
+                        fi
+                    fi
+                fi
+            else
+                log_warn "Could not reach network RPC"
+            fi
+
+            echo ""
+            echo -e "  ${BLUE}Refreshing every 3s... (Ctrl+C to exit)${NC}"
+
+            tick_prev="$tick_now"
+            sleep 3
+        done
     elif container_exists; then
         log_warn "Lite node is stopped"
         docker ps -a --filter "name=${CONTAINER_NAME}" --format "table {{.Names}}\t{{.Status}}"
@@ -520,6 +620,81 @@ EOF
     log_ok "Reconfigured and restarted!"
 }
 
+do_reset() {
+    if ! container_exists; then
+        log_error "Lite node is not installed"
+        return 1
+    fi
+
+    echo ""
+    log_warn "This will DELETE all node data and restart with a fresh state."
+    read -rp "Are you sure? [y/N] " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        log_info "Cancelled"
+        return 0
+    fi
+
+    # Stop node
+    log_info "Stopping node..."
+    if container_running; then
+        cd "${DATA_DIR}" && docker compose stop qubic-lite
+        log_ok "Node stopped"
+    else
+        log_info "Node already stopped"
+    fi
+
+    # Delete volume data
+    local volume_path
+    volume_path=$(docker volume inspect qubic-lite_qubic-lite-data --format '{{.Mountpoint}}' 2>/dev/null || true)
+    if [ -n "$volume_path" ] && [ -d "$volume_path" ]; then
+        log_info "Deleting node data..."
+        rm -rf "${volume_path:?}"/*
+        log_ok "Node data deleted"
+    else
+        log_warn "Volume path not found, skipping data deletion"
+    fi
+
+    # Start node
+    log_info "Starting node..."
+    cd "${DATA_DIR}" && docker compose up -d
+    log_ok "Node reset complete! Starting with fresh state."
+}
+
+do_update() {
+    local script_path update_url tmp_file
+    script_path=$(realpath "$0" 2>/dev/null || echo "$0")
+    update_url="https://raw.githubusercontent.com/qubic/network-guardians/main/scripts/lite.sh"
+    tmp_file=$(mktemp)
+
+    log_info "Checking for updates..."
+
+    if ! curl -sfL --max-time 15 -o "$tmp_file" "$update_url"; then
+        rm -f "$tmp_file"
+        log_error "Failed to download update"
+        return 1
+    fi
+
+    # Verify download is a valid script
+    if ! head -1 "$tmp_file" | grep -q '^#!/bin/bash'; then
+        rm -f "$tmp_file"
+        log_error "Downloaded file is not a valid script"
+        return 1
+    fi
+
+    # Check if there are changes
+    if cmp -s "$script_path" "$tmp_file"; then
+        rm -f "$tmp_file"
+        log_ok "Already up to date"
+        return 0
+    fi
+
+    # Apply update
+    chmod +x "$tmp_file"
+    mv "$tmp_file" "$script_path"
+    log_ok "Updated successfully!"
+    log_info "Restart the script to use the new version"
+}
+
 interactive_install() {
     echo ""
     echo "=== Lite Node Installer ==="
@@ -576,11 +751,15 @@ interactive_menu() {
         echo -e "         ${CYAN}│${NC}   6) stop      7) start      8) restart${CYAN}│${NC}"
         echo -e "         ${CYAN}│${NC}   9) reconfigure  change seed/alias    ${CYAN}│${NC}"
         echo -e "         ${CYAN}│${NC}  10) watch      live download progress ${CYAN}│${NC}"
+        echo -e "         ${CYAN}│${NC}  11) reset      wipe data & restart    ${CYAN}│${NC}"
+        echo -e "         ${CYAN}│${NC}                                        ${CYAN}│${NC}"
+        echo -e "         ${CYAN}│${NC} ${GREEN}OTHER${NC}                                  ${CYAN}│${NC}"
+        echo -e "         ${CYAN}│${NC}  12) update     update client script   ${CYAN}│${NC}"
         echo -e "         ${CYAN}│${NC}                                        ${CYAN}│${NC}"
         echo -e "         ${CYAN}│${NC}   0) exit                              ${CYAN}│${NC}"
         echo -e "         ${CYAN}└────────────────────────────────────────┘${NC}"
         echo ""
-        read -rp "         Select [0-10]: " choice
+        read -rp "         Select [0-12]: " choice
 
         case "$choice" in
             0) echo ""; log_info "Goodbye!"; exit 0 ;;
@@ -594,6 +773,8 @@ interactive_menu() {
             8) do_restart || true ;;
             9) do_reconfigure || true ;;
             10) watch_snapshot_progress || true ;;
+            11) do_reset || true ;;
+            12) do_update || true ;;
             *) log_error "Invalid choice" ;;
         esac
 
@@ -639,6 +820,8 @@ case "$COMMAND" in
     start)      do_start ;;
     restart)      do_restart ;;
     reconfigure)  do_reconfigure ;;
+    reset)        do_reset ;;
+    update)       do_update ;;
     watch)        watch_snapshot_progress ;;
     help|--help|-h) print_usage ;;
     *)          log_error "Unknown command: $COMMAND"; print_usage; exit 1 ;;
