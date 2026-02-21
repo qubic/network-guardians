@@ -16,6 +16,7 @@
 #   start         Start container
 #   restart       Restart container
 #   reconfigure   Change seed/alias and restart
+#   update        Update this script to latest version
 #
 
 set -e
@@ -28,6 +29,9 @@ DATA_DIR="/opt/qubic-bob"
 # Default ports
 P2P_PORT=21842
 API_PORT=40420
+
+# Public RPC
+NETWORK_RPC="https://rpc.qubic.org/v1/tick-info"
 
 # --- Colors ---
 RED='\033[0;31m'
@@ -61,6 +65,7 @@ print_usage() {
     echo "  start         Start container"
     echo "  restart       Restart container"
     echo "  reconfigure   Change seed/alias and restart"
+    echo "  update        Update this script to latest version"
     echo ""
     echo "Install/Reconfigure options:"
     echo "  --seed <seed>       Node seed (55 lowercase letters) [REQUIRED]"
@@ -103,6 +108,37 @@ container_exists() {
 
 container_running() {
     docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"
+}
+
+get_network_tick() {
+    local resp
+    resp=$(curl -sf --max-time 5 "$NETWORK_RPC" 2>/dev/null || true)
+    [ -n "$resp" ] && echo "$resp" | grep -oP '"tick":\K[0-9]+' | head -1
+}
+
+get_local_tick() {
+    local resp
+    resp=$(curl -sf --max-time 5 "http://localhost:${API_PORT}/status" 2>/dev/null || true)
+    [ -n "$resp" ] && echo "$resp" | grep -oP '"currentFetchingTick":\K[0-9]+'
+}
+
+format_number() {
+    printf "%'d" "$1" 2>/dev/null || echo "$1"
+}
+
+format_eta() {
+    local seconds=$1
+    if [ "$seconds" -lt 60 ]; then
+        echo "< 1 min"
+    elif [ "$seconds" -lt 3600 ]; then
+        echo "~$((seconds / 60)) min"
+    elif [ "$seconds" -lt 86400 ]; then
+        local h=$((seconds / 3600)) m=$(( (seconds % 3600) / 60 ))
+        echo "~${h}h ${m}m"
+    else
+        local d=$((seconds / 86400)) h=$(( (seconds % 86400) / 3600 ))
+        echo "~${d}d ${h}h"
+    fi
 }
 
 do_install() {
@@ -249,20 +285,83 @@ do_uninstall() {
 
 do_status() {
     if container_running; then
-        log_ok "Bob node is running"
-        echo ""
-        docker ps --filter "name=${CONTAINER_NAME}" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
-        docker ps --filter "name=watchtower-bob" --format "table {{.Names}}\t{{.Status}}" 2>/dev/null || true
-        echo ""
-        log_info "Checking API endpoint..."
-        local response
-        response=$(curl -sf --max-time 5 "http://localhost:${API_PORT}/status" 2>/dev/null || true)
-        if [ -n "$response" ]; then
-            echo "$response" | head -c 500
+        trap 'echo ""; return 0' INT
+
+        local tick_prev=""
+        while true; do
+            clear
+            print_logo
+            log_ok "Bob node is running"
             echo ""
-        else
-            log_warn "API not responding on port ${API_PORT}"
-        fi
+            docker ps --filter "name=${CONTAINER_NAME}" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+            docker ps --filter "name=watchtower-bob" --format "table {{.Names}}\t{{.Status}}" 2>/dev/null || true
+
+            local tick_now
+            tick_now=$(get_local_tick)
+
+            if [ -z "$tick_now" ]; then
+                echo ""
+                log_warn "API not responding on port ${API_PORT}"
+                echo ""
+                echo -e "  ${BLUE}Refreshing every 3s... (Ctrl+C to exit)${NC}"
+                tick_prev=""
+                sleep 3
+                continue
+            fi
+
+            local net_tick
+            net_tick=$(get_network_tick)
+
+            echo ""
+            echo -e "  ${GREEN}=== Node Health ===${NC}"
+            echo ""
+
+            # Determine if ticking (compare with previous reading)
+            local ticking=false
+            if [ -n "$tick_prev" ] && [ "$tick_now" -gt "$tick_prev" ] 2>/dev/null; then
+                ticking=true
+            fi
+
+            if [ -n "$net_tick" ] && [ "$tick_now" -ge "$net_tick" ] 2>/dev/null; then
+                echo -e "  Status:    ${GREEN}● SYNCED${NC}"
+            elif [ -z "$tick_prev" ]; then
+                echo -e "  Status:    ${YELLOW}● CHECKING...${NC}"
+            elif [ "$ticking" = true ]; then
+                echo -e "  Status:    ${YELLOW}● SYNCING${NC} (ticking)"
+            else
+                echo -e "  Status:    ${RED}● NOT TICKING${NC}"
+            fi
+
+            echo -e "  Node Tick: ${CYAN}$(format_number "$tick_now")${NC}"
+
+            if [ -n "$net_tick" ]; then
+                echo -e "  Net Tick:  $(format_number "$net_tick")"
+
+                local behind=$((net_tick - tick_now))
+                if [ "$behind" -gt 0 ]; then
+                    local pct
+                    pct=$(awk "BEGIN {printf \"%.1f\", $tick_now * 100 / $net_tick}")
+                    echo -e "  Behind:    $(format_number "$behind") ticks (${pct}% synced)"
+
+                    # ETA based on measured tick rate
+                    if [ "$ticking" = true ] && [ -n "$tick_prev" ]; then
+                        local rate=$((tick_now - tick_prev))
+                        if [ "$rate" -gt 0 ]; then
+                            local eta_sec=$((behind * 3 / rate))
+                            echo -e "  ETA:       ${CYAN}$(format_eta "$eta_sec")${NC}"
+                        fi
+                    fi
+                fi
+            else
+                log_warn "Could not reach network RPC"
+            fi
+
+            echo ""
+            echo -e "  ${BLUE}Refreshing every 3s... (Ctrl+C to exit)${NC}"
+
+            tick_prev="$tick_now"
+            sleep 3
+        done
     elif container_exists; then
         log_warn "Bob node is stopped"
         docker ps -a --filter "name=${CONTAINER_NAME}" --format "table {{.Names}}\t{{.Status}}"
@@ -403,6 +502,41 @@ EOF
     log_ok "Reconfigured and restarted!"
 }
 
+do_update() {
+    local script_path update_url tmp_file
+    script_path=$(realpath "$0" 2>/dev/null || echo "$0")
+    update_url="https://raw.githubusercontent.com/qubic/network-guardians/main/scripts/bob.sh"
+    tmp_file=$(mktemp)
+
+    log_info "Checking for updates..."
+
+    if ! curl -sfL --max-time 15 -o "$tmp_file" "$update_url"; then
+        rm -f "$tmp_file"
+        log_error "Failed to download update"
+        return 1
+    fi
+
+    # Verify download is a valid script
+    if ! head -1 "$tmp_file" | grep -q '^#!/bin/bash'; then
+        rm -f "$tmp_file"
+        log_error "Downloaded file is not a valid script"
+        return 1
+    fi
+
+    # Check if there are changes
+    if cmp -s "$script_path" "$tmp_file"; then
+        rm -f "$tmp_file"
+        log_ok "Already up to date"
+        return 0
+    fi
+
+    # Apply update
+    chmod +x "$tmp_file"
+    mv "$tmp_file" "$script_path"
+    log_ok "Updated successfully!"
+    log_info "Restart the script to use the new version"
+}
+
 interactive_install() {
     echo ""
     echo "=== Bob Node Installer ==="
@@ -465,10 +599,13 @@ interactive_menu() {
         echo -e "         ${CYAN}│${NC}   6) stop      7) start     8) restart ${CYAN}│${NC}"
         echo -e "         ${CYAN}│${NC}   9) reconfigure  change seed/alias    ${CYAN}│${NC}"
         echo -e "         ${CYAN}│${NC}                                        ${CYAN}│${NC}"
+        echo -e "         ${CYAN}│${NC} ${GREEN}OTHER${NC}                                  ${CYAN}│${NC}"
+        echo -e "         ${CYAN}│${NC}  10) update     update client script   ${CYAN}│${NC}"
+        echo -e "         ${CYAN}│${NC}                                        ${CYAN}│${NC}"
         echo -e "         ${CYAN}│${NC}   0) exit                              ${CYAN}│${NC}"
         echo -e "         ${CYAN}└────────────────────────────────────────┘${NC}"
         echo ""
-        read -rp "         Select [0-9]: " choice
+        read -rp "         Select [0-10]: " choice
 
         case "$choice" in
             0) echo ""; log_info "Goodbye!"; exit 0 ;;
@@ -481,6 +618,7 @@ interactive_menu() {
             7) do_start || true ;;
             8) do_restart || true ;;
             9) do_reconfigure || true ;;
+            10) do_update || true ;;
             *) log_error "Invalid choice" ;;
         esac
 
@@ -525,6 +663,7 @@ case "$COMMAND" in
     start)      do_start ;;
     restart)      do_restart ;;
     reconfigure)  do_reconfigure ;;
+    update)       do_update ;;
     help|--help|-h) print_usage ;;
     *)          log_error "Unknown command: $COMMAND"; print_usage; exit 1 ;;
 esac
