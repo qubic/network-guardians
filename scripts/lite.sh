@@ -22,6 +22,9 @@
 
 set -e
 
+# Resolve script path before any cd
+SCRIPT_PATH=$(realpath "$0" 2>/dev/null || readlink -f "$0" 2>/dev/null || echo "$0")
+
 # --- Config ---
 CONTAINER_NAME="qubic-lite"
 DOCKER_IMAGE="qubiccore/lite"
@@ -255,10 +258,8 @@ EOF
     echo ""
 
     # Remove original script if not in DATA_DIR
-    local script_path
-    script_path=$(realpath "$0" 2>/dev/null || echo "$0")
-    if [ "$script_path" != "${DATA_DIR}/lite.sh" ] && [ -f "$script_path" ]; then
-        rm -f "$script_path"
+    if [ "$SCRIPT_PATH" != "${DATA_DIR}/lite.sh" ] && [ -f "$SCRIPT_PATH" ]; then
+        rm -f "$SCRIPT_PATH"
         log_ok "Removed installer from download location"
     fi
 
@@ -628,41 +629,20 @@ do_reset() {
 
     echo ""
     log_warn "This will DELETE all node data and restart with a fresh state."
+    log_warn "Config (seed/alias) will be kept."
     read -rp "Are you sure? [y/N] " confirm
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
         log_info "Cancelled"
         return 0
     fi
 
-    # Stop node
-    log_info "Stopping node..."
-    if container_running; then
-        cd "${DATA_DIR}" && docker compose stop qubic-lite
-        log_ok "Node stopped"
-    else
-        log_info "Node already stopped"
-    fi
-
-    # Delete volume data
-    local volume_path
-    volume_path=$(docker volume inspect qubic-lite_qubic-lite-data --format '{{.Mountpoint}}' 2>/dev/null || true)
-    if [ -n "$volume_path" ] && [ -d "$volume_path" ]; then
-        log_info "Deleting node data..."
-        rm -rf "${volume_path:?}"/*
-        log_ok "Node data deleted"
-    else
-        log_warn "Volume path not found, skipping data deletion"
-    fi
-
-    # Start node
-    log_info "Starting node..."
-    cd "${DATA_DIR}" && docker compose up -d
+    log_info "Wiping data and restarting..."
+    cd "${DATA_DIR}" && docker compose down -v && docker compose up -d
     log_ok "Node reset complete! Starting with fresh state."
 }
 
 do_update() {
-    local script_path update_url tmp_file
-    script_path=$(realpath "$0" 2>/dev/null || echo "$0")
+    local update_url tmp_file
     update_url="https://raw.githubusercontent.com/qubic/network-guardians/main/scripts/lite.sh"
     tmp_file=$(mktemp)
 
@@ -682,7 +662,7 @@ do_update() {
     fi
 
     # Check if there are changes
-    if cmp -s "$script_path" "$tmp_file"; then
+    if cmp -s "$SCRIPT_PATH" "$tmp_file"; then
         rm -f "$tmp_file"
         log_ok "Already up to date"
         return 0
@@ -690,7 +670,7 @@ do_update() {
 
     # Apply update
     chmod +x "$tmp_file"
-    mv "$tmp_file" "$script_path"
+    mv "$tmp_file" "$SCRIPT_PATH"
     log_ok "Updated successfully!"
     log_info "Restart the script to use the new version"
 }
