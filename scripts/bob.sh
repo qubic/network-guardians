@@ -16,10 +16,14 @@
 #   start         Start container
 #   restart       Restart container
 #   reconfigure   Change seed/alias and restart
+#   reset         Wipe node data and restart fresh
 #   update        Update this script to latest version
 #
 
 set -e
+
+# Resolve script path before any cd
+SCRIPT_PATH=$(realpath "$0" 2>/dev/null || readlink -f "$0" 2>/dev/null || echo "$0")
 
 # --- Config ---
 CONTAINER_NAME="qubic-bob"
@@ -65,6 +69,7 @@ print_usage() {
     echo "  start         Start container"
     echo "  restart       Restart container"
     echo "  reconfigure   Change seed/alias and restart"
+    echo "  reset         Wipe node data and restart fresh"
     echo "  update        Update this script to latest version"
     echo ""
     echo "Install/Reconfigure options:"
@@ -201,9 +206,7 @@ services:
     env_file:
       - .env
     volumes:
-      - qubic-bob-redis:/data/redis
-      - qubic-bob-kvrocks:/data/kvrocks
-      - qubic-bob-data:/data/bob
+      - qubic-bob-data:/data
 
   watchtower:
     image: containrrr/watchtower
@@ -216,8 +219,6 @@ services:
     command: --interval 300 ${CONTAINER_NAME}
 
 volumes:
-  qubic-bob-redis:
-  qubic-bob-kvrocks:
   qubic-bob-data:
 EOF
 
@@ -238,10 +239,8 @@ EOF
     echo ""
 
     # Remove original script if not in DATA_DIR
-    local script_path
-    script_path=$(realpath "$0" 2>/dev/null || echo "$0")
-    if [ "$script_path" != "${DATA_DIR}/bob.sh" ] && [ -f "$script_path" ]; then
-        rm -f "$script_path"
+    if [ "$SCRIPT_PATH" != "${DATA_DIR}/bob.sh" ] && [ -f "$SCRIPT_PATH" ]; then
+        rm -f "$SCRIPT_PATH"
         log_ok "Removed installer from download location"
     fi
 
@@ -502,9 +501,28 @@ EOF
     log_ok "Reconfigured and restarted!"
 }
 
+do_reset() {
+    if ! container_exists; then
+        log_error "Bob node is not installed"
+        return 1
+    fi
+
+    echo ""
+    log_warn "This will DELETE all node data and restart with a fresh state."
+    log_warn "Config (seed/alias) will be kept."
+    read -rp "Are you sure? [y/N] " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        log_info "Cancelled"
+        return 0
+    fi
+
+    log_info "Wiping data and restarting..."
+    cd "${DATA_DIR}" && docker compose down -v && docker compose up -d
+    log_ok "Node reset complete! Starting with fresh state."
+}
+
 do_update() {
-    local script_path update_url tmp_file
-    script_path=$(realpath "$0" 2>/dev/null || echo "$0")
+    local update_url tmp_file
     update_url="https://raw.githubusercontent.com/qubic/network-guardians/main/scripts/bob.sh"
     tmp_file=$(mktemp)
 
@@ -524,7 +542,7 @@ do_update() {
     fi
 
     # Check if there are changes
-    if cmp -s "$script_path" "$tmp_file"; then
+    if cmp -s "$SCRIPT_PATH" "$tmp_file"; then
         rm -f "$tmp_file"
         log_ok "Already up to date"
         return 0
@@ -532,7 +550,7 @@ do_update() {
 
     # Apply update
     chmod +x "$tmp_file"
-    mv "$tmp_file" "$script_path"
+    mv "$tmp_file" "$SCRIPT_PATH"
     log_ok "Updated successfully!"
     log_info "Restart the script to use the new version"
 }
@@ -599,13 +617,15 @@ interactive_menu() {
         echo -e "         ${CYAN}│${NC}   6) stop      7) start     8) restart ${CYAN}│${NC}"
         echo -e "         ${CYAN}│${NC}   9) reconfigure  change seed/alias    ${CYAN}│${NC}"
         echo -e "         ${CYAN}│${NC}                                        ${CYAN}│${NC}"
+        echo -e "         ${CYAN}│${NC}  10) reset      wipe data & restart    ${CYAN}│${NC}"
+        echo -e "         ${CYAN}│${NC}                                        ${CYAN}│${NC}"
         echo -e "         ${CYAN}│${NC} ${GREEN}OTHER${NC}                                  ${CYAN}│${NC}"
-        echo -e "         ${CYAN}│${NC}  10) update     update client script   ${CYAN}│${NC}"
+        echo -e "         ${CYAN}│${NC}  11) update     update client script   ${CYAN}│${NC}"
         echo -e "         ${CYAN}│${NC}                                        ${CYAN}│${NC}"
         echo -e "         ${CYAN}│${NC}   0) exit                              ${CYAN}│${NC}"
         echo -e "         ${CYAN}└────────────────────────────────────────┘${NC}"
         echo ""
-        read -rp "         Select [0-10]: " choice
+        read -rp "         Select [0-11]: " choice
 
         case "$choice" in
             0) echo ""; log_info "Goodbye!"; exit 0 ;;
@@ -618,7 +638,8 @@ interactive_menu() {
             7) do_start || true ;;
             8) do_restart || true ;;
             9) do_reconfigure || true ;;
-            10) do_update || true ;;
+            10) do_reset || true ;;
+            11) do_update || true ;;
             *) log_error "Invalid choice" ;;
         esac
 
@@ -663,6 +684,7 @@ case "$COMMAND" in
     start)      do_start ;;
     restart)      do_restart ;;
     reconfigure)  do_reconfigure ;;
+    reset)        do_reset ;;
     update)       do_update ;;
     help|--help|-h) print_usage ;;
     *)          log_error "Unknown command: $COMMAND"; print_usage; exit 1 ;;
