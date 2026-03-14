@@ -17,6 +17,7 @@
 #   restart       Restart container
 #   reconfigure   Change seed/alias and restart
 #   reset         Wipe node data and restart fresh
+#   migrate       Migrate from named volumes to bind mounts
 #   update        Update this script to latest version
 #
 
@@ -70,6 +71,7 @@ print_usage() {
     echo "  restart       Restart container"
     echo "  reconfigure   Change seed/alias and restart"
     echo "  reset         Wipe node data and restart fresh"
+    echo "  migrate       Migrate from named volumes to bind mounts"
     echo "  update        Update this script to latest version"
     echo ""
     echo "Install/Reconfigure options:"
@@ -146,6 +148,28 @@ format_eta() {
     fi
 }
 
+# Check if the current compose file still uses named volumes
+uses_named_volumes() {
+    [ -f "${DATA_DIR}/docker-compose.yml" ] && grep -q "qubic-bob-data:/data" "${DATA_DIR}/docker-compose.yml"
+}
+
+# Wipe bind-mounted data directories and recreate them
+wipe_data_dirs() {
+    rm -rf "${DATA_DIR}/data/kvrocks" "${DATA_DIR}/data/redis" "${DATA_DIR}/data/bob"
+    mkdir -p "${DATA_DIR}/data/kvrocks" "${DATA_DIR}/data/redis" "${DATA_DIR}/data/bob"
+}
+
+# Stop containers and wipe all node data, handling both old (named volumes) and new (bind mounts) setups
+stop_and_wipe() {
+    cd "${DATA_DIR}"
+    if uses_named_volumes; then
+        docker compose down -v
+    else
+        docker compose down
+        wipe_data_dirs
+    fi
+}
+
 do_install() {
     log_info "Installing Bob node..."
 
@@ -173,8 +197,8 @@ do_install() {
     fi
     docker rm -f watchtower-bob &>/dev/null || true
 
-    # Create directory
-    mkdir -p "${DATA_DIR}"
+    # Create directories
+    mkdir -p "${DATA_DIR}/data/kvrocks" "${DATA_DIR}/data/redis" "${DATA_DIR}/data/bob"
 
     # Copy script for management
     cp "$0" "${DATA_DIR}/bob.sh" 2>/dev/null || true
@@ -206,7 +230,9 @@ services:
     env_file:
       - .env
     volumes:
-      - qubic-bob-data:/data
+      - ./data/kvrocks:/data/kvrocks
+      - ./data/redis:/data/redis
+      - ./data/bob:/data/bob
 
   watchtower:
     image: containrrr/watchtower
@@ -217,9 +243,6 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     command: --interval 300 ${CONTAINER_NAME}
-
-volumes:
-  qubic-bob-data:
 EOF
 
     # Start containers
@@ -230,6 +253,7 @@ EOF
     echo ""
     echo "  Container:   $CONTAINER_NAME"
     echo "  Config:      ${DATA_DIR}/.env"
+    echo "  Data:        ${DATA_DIR}/data/"
     echo "  P2P:         port ${P2P_PORT}"
     echo "  API:         http://localhost:${API_PORT}"
     echo "  Auto-Update: enabled (Watchtower)"
@@ -252,7 +276,7 @@ do_uninstall() {
 
     # Stop containers
     if [ -f "${DATA_DIR}/docker-compose.yml" ]; then
-        docker compose -f "${DATA_DIR}/docker-compose.yml" down -v 2>/dev/null || true
+        docker compose -f "${DATA_DIR}/docker-compose.yml" down 2>/dev/null || true
         log_ok "Containers stopped"
     elif container_exists; then
         docker rm -f "$CONTAINER_NAME" &>/dev/null || true
@@ -273,6 +297,10 @@ do_uninstall() {
             log_info "Data kept at ${DATA_DIR}"
         fi
     fi
+
+    # Clean up any leftover named volumes from old installations
+    docker volume rm "qubic-bob_qubic-bob-data" 2>/dev/null || true
+    docker volume prune -f 2>/dev/null || true
 
     log_ok "Uninstall complete"
 
@@ -495,9 +523,10 @@ EOF
     chmod 600 "${DATA_DIR}/.env"
     log_ok "Config updated"
 
-    # Restart with volume reset
+    # Restart with data wipe
     log_info "Restarting with fresh data..."
-    cd "${DATA_DIR}" && docker compose down -v && docker compose up -d
+    stop_and_wipe
+    cd "${DATA_DIR}" && docker compose up -d
     log_ok "Reconfigured and restarted!"
 }
 
@@ -517,8 +546,130 @@ do_reset() {
     fi
 
     log_info "Wiping data and restarting..."
-    cd "${DATA_DIR}" && docker compose down -v && docker compose up -d
+    stop_and_wipe
+    cd "${DATA_DIR}" && docker compose up -d
     log_ok "Node reset complete! Starting with fresh state."
+}
+
+do_migrate() {
+    log_info "Checking if migration is needed..."
+
+    if [ ! -f "${DATA_DIR}/docker-compose.yml" ]; then
+        log_error "No docker-compose.yml found at ${DATA_DIR}."
+        log_error "Nothing to migrate. Run install first."
+        return 1
+    fi
+
+    if ! uses_named_volumes; then
+        log_ok "Already using bind mounts. No migration needed."
+        return 0
+    fi
+
+    if ! container_exists; then
+        log_error "Container '$CONTAINER_NAME' not found."
+        return 1
+    fi
+
+    echo ""
+    log_info "This will migrate from Docker named volumes to local bind mounts."
+    log_info "Data will be stored under ${DATA_DIR}/data/"
+    echo ""
+    read -rp "Continue? [y/N] " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        log_info "Cancelled"
+        return 0
+    fi
+
+    # Step 1: Stop internal services
+    if container_running; then
+        echo ""
+        log_info "Stopping internal services (redis/kvrocks)..."
+        docker exec "$CONTAINER_NAME" /bin/sh -c '
+            if command -v supervisorctl > /dev/null 2>&1; then
+                supervisorctl stop all 2>/dev/null || true
+                sleep 3
+            else
+                kill $(pgrep -f redis-server 2>/dev/null) 2>/dev/null || true
+                kill $(pgrep -f kvrocks 2>/dev/null) 2>/dev/null || true
+                sleep 3
+            fi
+        ' 2>/dev/null || log_warn "Could not stop internal services. Continuing anyway."
+        log_ok "Internal services stopped"
+    fi
+
+    # Step 2: Create data directories
+    log_info "Creating data directories..."
+    mkdir -p "${DATA_DIR}/data/kvrocks" "${DATA_DIR}/data/redis" "${DATA_DIR}/data/bob"
+
+    # Step 3: Copy data from container
+    log_info "Copying data from container..."
+    for subdir in kvrocks redis bob; do
+        echo "  -> /data/${subdir}"
+        docker cp "$CONTAINER_NAME":/data/${subdir}/. "${DATA_DIR}/data/${subdir}/" 2>/dev/null || \
+            log_warn "Could not copy /data/${subdir} (may be empty)"
+    done
+
+    echo ""
+    log_info "Data sizes:"
+    du -sh "${DATA_DIR}/data"/* 2>/dev/null || echo "  (empty)"
+    echo ""
+
+    # Step 4: Backup compose file
+    local timestamp
+    timestamp=$(date +%Y%m%d_%H%M%S)
+    cp "${DATA_DIR}/docker-compose.yml" "${DATA_DIR}/docker-compose.yml.backup.${timestamp}"
+    log_ok "Compose backup: docker-compose.yml.backup.${timestamp}"
+
+    # Step 5: Stop containers
+    log_info "Stopping containers..."
+    cd "${DATA_DIR}" && docker compose down
+
+    # Step 6: Patch docker-compose.yml
+    log_info "Patching docker-compose.yml..."
+
+    # Get the indentation of the existing volume line
+    local indent
+    indent=$(grep "qubic-bob-data:/data" "${DATA_DIR}/docker-compose.yml" | sed 's/\(-.*\)//')
+
+    # Replace the named volume mount with three bind mounts
+    sed -i "s|^.*- qubic-bob-data:/data.*$|${indent}- ./data/kvrocks:/data/kvrocks\n${indent}- ./data/redis:/data/redis\n${indent}- ./data/bob:/data/bob|" "${DATA_DIR}/docker-compose.yml"
+
+    # Remove the top-level volumes block and the qubic-bob-data entry
+    sed -i '/^volumes:/,/^[^ ]/{/^volumes:/d; /^[[:space:]]*qubic-bob-data:/d; /^[[:space:]]*$/d}' "${DATA_DIR}/docker-compose.yml"
+
+    # Clean up trailing blank lines
+    sed -i -e :a -e '/^\n*$/{$d;N;ba}' "${DATA_DIR}/docker-compose.yml"
+
+    echo ""
+    log_info "Changes applied:"
+    diff "${DATA_DIR}/docker-compose.yml.backup.${timestamp}" "${DATA_DIR}/docker-compose.yml" || true
+    echo ""
+
+    # Step 7: Start containers
+    log_info "Starting containers..."
+    docker compose up -d
+
+    # Step 8: Clean up old volumes
+    log_info "Cleaning up old Docker volumes..."
+    docker volume rm "qubic-bob_qubic-bob-data" 2>/dev/null && \
+        log_ok "Removed named volume qubic-bob_qubic-bob-data" || true
+    docker volume prune -f 2>/dev/null || true
+
+    # Verify
+    sleep 3
+    if container_running; then
+        echo ""
+        log_ok "Migration complete!"
+        echo ""
+        echo "  Data is now at: ${DATA_DIR}/data/"
+        docker inspect "$CONTAINER_NAME" --format '{{range .Mounts}}  {{.Type}}  {{.Source}} -> {{.Destination}}{{"\n"}}{{end}}'
+        echo ""
+    else
+        log_error "Container is not running after migration!"
+        log_error "Check logs: docker compose logs"
+        log_info "Your backup: ${DATA_DIR}/docker-compose.yml.backup.${timestamp}"
+        log_info "Your data:   ${DATA_DIR}/data/"
+    fi
 }
 
 do_update() {
@@ -607,6 +758,9 @@ interactive_menu() {
         echo ""
         print_logo
 
+        local needs_migrate=false
+        uses_named_volumes && needs_migrate=true
+
         echo -e "         ${CYAN}┌────────────────────────────────────────┐${NC}"
         echo -e "         ${CYAN}│${NC} ${GREEN}INSTALL${NC}                                ${CYAN}│${NC}"
         echo -e "         ${CYAN}│${NC}   1) install       setup bob node      ${CYAN}│${NC}"
@@ -621,11 +775,14 @@ interactive_menu() {
         echo -e "         ${CYAN}│${NC}                                        ${CYAN}│${NC}"
         echo -e "         ${CYAN}│${NC} ${GREEN}OTHER${NC}                                  ${CYAN}│${NC}"
         echo -e "         ${CYAN}│${NC}  11) update     update client script   ${CYAN}│${NC}"
+        if [ "$needs_migrate" = true ]; then
+        echo -e "         ${CYAN}│${NC}  12) ${YELLOW}migrate${NC}    volumes → bind mounts  ${CYAN}│${NC}"
+        fi
         echo -e "         ${CYAN}│${NC}                                        ${CYAN}│${NC}"
         echo -e "         ${CYAN}│${NC}   0) exit                              ${CYAN}│${NC}"
         echo -e "         ${CYAN}└────────────────────────────────────────┘${NC}"
         echo ""
-        read -rp "         Select [0-11]: " choice
+        read -rp "         Select: " choice
 
         case "$choice" in
             0) echo ""; log_info "Goodbye!"; exit 0 ;;
@@ -640,6 +797,7 @@ interactive_menu() {
             9) do_reconfigure || true ;;
             10) do_reset || true ;;
             11) do_update || true ;;
+            12) if [ "$needs_migrate" = true ]; then do_migrate || true; else log_error "Invalid choice"; fi ;;
             *) log_error "Invalid choice" ;;
         esac
 
@@ -685,6 +843,7 @@ case "$COMMAND" in
     restart)      do_restart ;;
     reconfigure)  do_reconfigure ;;
     reset)        do_reset ;;
+    migrate)      do_migrate ;;
     update)       do_update ;;
     help|--help|-h) print_usage ;;
     *)          log_error "Unknown command: $COMMAND"; print_usage; exit 1 ;;
