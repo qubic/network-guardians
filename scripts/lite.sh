@@ -17,6 +17,7 @@
 #   restart       Restart container
 #   reconfigure   Change seed/alias and restart
 #   reset         Wipe node data and restart fresh
+#   snapshot      Trigger a snapshot save
 #   update        Update this script to latest version
 #
 
@@ -70,6 +71,7 @@ print_usage() {
     echo "  restart       Restart container"
     echo "  reconfigure   Change seed/alias and restart"
     echo "  reset         Wipe node data and restart fresh"
+    echo "  snapshot      Trigger a snapshot save (F8)"
     echo "  update        Update this script to latest version"
     echo "  watch         Live snapshot download progress"
     echo ""
@@ -539,7 +541,10 @@ do_logs() {
 }
 
 do_stop() {
-    if container_running; then
+    if [ -f "${DATA_DIR}/docker-compose.yml" ]; then
+        cd "${DATA_DIR}" && docker compose down
+        log_ok "Stopped"
+    elif container_running; then
         docker stop "$CONTAINER_NAME"
         log_ok "Stopped"
     else
@@ -567,7 +572,7 @@ do_start() {
 
 do_restart() {
     if [ -f "${DATA_DIR}/docker-compose.yml" ]; then
-        cd "${DATA_DIR}" && docker compose up -d --force-recreate
+        cd "${DATA_DIR}" && docker compose down && docker compose up -d
         log_ok "Restarted"
     elif container_exists; then
         docker restart "$CONTAINER_NAME"
@@ -639,6 +644,32 @@ do_reset() {
     log_info "Wiping data and restarting..."
     cd "${DATA_DIR}" && docker compose down -v && docker compose up -d
     log_ok "Node reset complete! Starting with fresh state."
+}
+
+do_snapshot() {
+    if ! container_running; then
+        log_error "Lite node is not running"
+        return 1
+    fi
+
+    log_info "Triggering snapshot (F8)..."
+    local result
+    result=$(docker exec "$CONTAINER_NAME" orchestrator-ctl send-key f8 2>&1) || {
+        log_error "Failed to trigger snapshot"
+        echo "  $result"
+        return 1
+    }
+
+    # Parse JSON response
+    local status msg
+    status=$(echo "$result" | grep -oP '"status"\s*:\s*"\K[^"]+' | head -1)
+    msg=$(echo "$result" | grep -oP '"message"\s*:\s*"\K[^"]+' | head -1)
+
+    if [ "$status" = "ok" ]; then
+        log_ok "Snapshot: ${msg:-triggered successfully}"
+    else
+        log_warn "Snapshot: ${msg:-$result}"
+    fi
 }
 
 do_update() {
@@ -732,14 +763,15 @@ interactive_menu() {
         echo -e "         ${CYAN}│${NC}   9) reconfigure  change seed/alias    ${CYAN}│${NC}"
         echo -e "         ${CYAN}│${NC}  10) watch      live download progress ${CYAN}│${NC}"
         echo -e "         ${CYAN}│${NC}  11) reset      wipe data & restart    ${CYAN}│${NC}"
+        echo -e "         ${CYAN}│${NC}  12) snapshot   trigger snapshot (F8)  ${CYAN}│${NC}"
         echo -e "         ${CYAN}│${NC}                                        ${CYAN}│${NC}"
         echo -e "         ${CYAN}│${NC} ${GREEN}OTHER${NC}                                  ${CYAN}│${NC}"
-        echo -e "         ${CYAN}│${NC}  12) update     update client script   ${CYAN}│${NC}"
+        echo -e "         ${CYAN}│${NC}  13) update     update client script   ${CYAN}│${NC}"
         echo -e "         ${CYAN}│${NC}                                        ${CYAN}│${NC}"
         echo -e "         ${CYAN}│${NC}   0) exit                              ${CYAN}│${NC}"
         echo -e "         ${CYAN}└────────────────────────────────────────┘${NC}"
         echo ""
-        read -rp "         Select [0-12]: " choice
+        read -rp "         Select [0-13]: " choice
 
         case "$choice" in
             0) echo ""; log_info "Goodbye!"; exit 0 ;;
@@ -754,7 +786,8 @@ interactive_menu() {
             9) do_reconfigure || true ;;
             10) watch_snapshot_progress || true ;;
             11) do_reset || true ;;
-            12) do_update || true ;;
+            12) do_snapshot || true ;;
+            13) do_update || true ;;
             *) log_error "Invalid choice" ;;
         esac
 
@@ -801,6 +834,7 @@ case "$COMMAND" in
     restart)      do_restart ;;
     reconfigure)  do_reconfigure ;;
     reset)        do_reset ;;
+    snapshot)     do_snapshot ;;
     update)       do_update ;;
     watch)        watch_snapshot_progress ;;
     help|--help|-h) print_usage ;;
