@@ -18,6 +18,7 @@
 #   reconfigure   Change seed/alias and restart
 #   reset         Wipe node data and restart fresh
 #   snapshot      Trigger a snapshot save
+#   deploy        Deploy with a specific Docker tag
 #   update        Update this script to latest version
 #
 
@@ -73,6 +74,7 @@ print_usage() {
     echo "  reset         Wipe node data and restart fresh"
     echo "  snapshot      Trigger a snapshot save (F8)"
     echo "  update        Update this script to latest version"
+    echo "  deploy        Deploy with a specific Docker tag"
     echo "  watch         Live snapshot download progress"
     echo ""
     echo "Install/Reconfigure options:"
@@ -83,8 +85,13 @@ print_usage() {
     echo "  --data-dir <path>     Data directory (default: /opt/qubic-lite)"
     echo "  --image <image>       Override Docker image (default: qubiccore/lite:latest)"
     echo ""
+    echo "Deploy options:"
+    echo "  --tag <tag>           Docker image tag (default: latest)"
+    echo ""
     echo "Examples:"
     echo "  $0 install --seed myseed --alias mynode"
+    echo "  $0 deploy --tag E207.2"
+    echo "  $0 deploy              (interactive, enter tag or default latest)"
     echo "  $0 logs"
     echo "  $0 status"
 }
@@ -541,15 +548,25 @@ do_logs() {
 }
 
 do_stop() {
+    if ! container_running; then
+        log_info "Already stopped"
+        return
+    fi
+
+    # Graceful shutdown: send ESC to Qubic process first
+    log_info "Sending ESC to Qubic process..."
+    docker exec "$CONTAINER_NAME" orchestrator-ctl send-key esc &>/dev/null && \
+        log_ok "ESC sent" || log_warn "Could not send ESC (continuing anyway)"
+
+    log_info "Waiting 30s for graceful shutdown..."
+    sleep 30
+
     if [ -f "${DATA_DIR}/docker-compose.yml" ]; then
         cd "${DATA_DIR}" && docker compose down
-        log_ok "Stopped"
-    elif container_running; then
-        docker stop "$CONTAINER_NAME"
-        log_ok "Stopped"
     else
-        log_info "Already stopped"
+        docker stop "$CONTAINER_NAME"
     fi
+    log_ok "Stopped"
 }
 
 do_start() {
@@ -672,6 +689,74 @@ do_snapshot() {
     fi
 }
 
+do_deploy() {
+    if [ ! -f "${DATA_DIR}/docker-compose.yml" ]; then
+        log_error "Lite node not installed. Run install first."
+        return 1
+    fi
+
+    # Get current image tag
+    local current_tag
+    current_tag=$(grep -oP 'image: qubiccore/lite:\K.*' "${DATA_DIR}/docker-compose.yml")
+    log_info "Current image tag: ${current_tag}"
+    echo ""
+
+    # Ask for tag
+    local tag
+    if [ -n "$DEPLOY_TAG" ]; then
+        tag="$DEPLOY_TAG"
+    else
+        read -rp "Enter Docker tag (e.g. E207.2) or press Enter for 'latest': " tag
+    fi
+    tag="${tag:-latest}"
+
+    if [ "$tag" = "$current_tag" ]; then
+        log_info "Already running ${DOCKER_IMAGE}:${tag}"
+        return 0
+    fi
+
+    # Update docker-compose.yml
+    sed -i "s|image: ${DOCKER_IMAGE}:.*|image: ${DOCKER_IMAGE}:${tag}|" "${DATA_DIR}/docker-compose.yml"
+
+    # Pull new image
+    log_info "Pulling ${DOCKER_IMAGE}:${tag}..."
+    if ! docker pull "${DOCKER_IMAGE}:${tag}"; then
+        log_error "Failed to pull ${DOCKER_IMAGE}:${tag}"
+        # Revert
+        sed -i "s|image: ${DOCKER_IMAGE}:.*|image: ${DOCKER_IMAGE}:${current_tag}|" "${DATA_DIR}/docker-compose.yml"
+        log_warn "Reverted to ${current_tag}"
+        return 1
+    fi
+
+    # Graceful stop: F8 (snapshot) -> ESC (shutdown)
+    if container_running; then
+        log_info "Triggering snapshot (F8)..."
+        docker exec "$CONTAINER_NAME" orchestrator-ctl send-key f8 &>/dev/null && \
+            log_ok "Snapshot triggered" || log_warn "Could not trigger snapshot (continuing anyway)"
+        log_info "Waiting 30s for snapshot to complete..."
+        sleep 30
+
+        log_info "Sending ESC to Qubic process..."
+        docker exec "$CONTAINER_NAME" orchestrator-ctl send-key esc &>/dev/null && \
+            log_ok "ESC sent" || log_warn "Could not send ESC (continuing anyway)"
+        log_info "Waiting 30s for graceful shutdown..."
+        sleep 30
+    fi
+
+    cd "${DATA_DIR}" && docker compose down && docker compose up -d
+
+    # Stop watchtower if custom tag (would revert to latest)
+    if [ "$tag" != "latest" ]; then
+        docker stop watchtower-lite &>/dev/null || true
+        log_warn "Watchtower stopped (would revert to :latest)"
+    else
+        docker start watchtower-lite &>/dev/null || true
+        log_ok "Watchtower enabled"
+    fi
+
+    log_ok "Deployed ${DOCKER_IMAGE}:${tag}"
+}
+
 do_update() {
     local update_url tmp_file
     update_url="https://raw.githubusercontent.com/qubic/network-guardians/main/scripts/lite.sh"
@@ -767,11 +852,12 @@ interactive_menu() {
         echo -e "         ${CYAN}│${NC}                                        ${CYAN}│${NC}"
         echo -e "         ${CYAN}│${NC} ${GREEN}OTHER${NC}                                  ${CYAN}│${NC}"
         echo -e "         ${CYAN}│${NC}  13) update     update client script   ${CYAN}│${NC}"
+        echo -e "         ${CYAN}│${NC}  14) deploy     deploy with custom tag ${CYAN}│${NC}"
         echo -e "         ${CYAN}│${NC}                                        ${CYAN}│${NC}"
         echo -e "         ${CYAN}│${NC}   0) exit                              ${CYAN}│${NC}"
         echo -e "         ${CYAN}└────────────────────────────────────────┘${NC}"
         echo ""
-        read -rp "         Select [0-13]: " choice
+        read -rp "         Select [0-14]: " choice
 
         case "$choice" in
             0) echo ""; log_info "Goodbye!"; exit 0 ;;
@@ -788,6 +874,7 @@ interactive_menu() {
             11) do_reset || true ;;
             12) do_snapshot || true ;;
             13) do_update || true ;;
+            14) do_deploy || true ;;
             *) log_error "Invalid choice" ;;
         esac
 
@@ -817,6 +904,7 @@ while [ $# -gt 0 ]; do
         --p2p-port)    P2P_PORT="$2"; shift 2 ;;
         --http-port)   HTTP_PORT="$2"; shift 2 ;;
         --data-dir)    DATA_DIR="$2"; shift 2 ;;
+        --tag)         DEPLOY_TAG="$2"; shift 2 ;;
         --image)       DOCKER_IMAGE="$2"; shift 2 ;;
         --help|-h)     print_usage; exit 0 ;;
         *)             log_error "Unknown option: $1"; print_usage; exit 1 ;;
@@ -836,6 +924,7 @@ case "$COMMAND" in
     reset)        do_reset ;;
     snapshot)     do_snapshot ;;
     update)       do_update ;;
+    deploy)       do_deploy ;;
     watch)        watch_snapshot_progress ;;
     help|--help|-h) print_usage ;;
     *)          log_error "Unknown command: $COMMAND"; print_usage; exit 1 ;;
