@@ -186,6 +186,10 @@ func (s *Service) poll(ctx context.Context) {
 			}
 		}
 
+		// If timestamp is in seconds instead of milliseconds, convert it
+		if checkin.Timestamp > 0 && checkin.Timestamp < 1_000_000_000_000 {
+			checkin.Timestamp *= 1000
+		}
 		// Convert API timestamp (milliseconds) to time.Time for accurate last_seen_at
 		lastSeenAt := time.UnixMilli(checkin.Timestamp)
 
