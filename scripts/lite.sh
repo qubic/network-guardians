@@ -310,26 +310,68 @@ do_uninstall() {
     fi
 }
 
-get_snapshot_total_size() {
-    local snap_url
-    snap_url=$(docker logs "$CONTAINER_NAME" 2>&1 | grep -oP 'Downloading \Khttps?://[^ "]+' | tail -1)
-    if [ -n "$snap_url" ]; then
-        curl -sI "$snap_url" 2>/dev/null | grep -i content-length | awk '{print $2}' | tr -d '\r'
+get_snapshot_chunk_info() {
+    # Returns "current_chunk total_chunks total_gb" from log
+    # Log: "Downloading chunked snapshot: 94 chunks, 46.99 GB"
+    # Log: "Downloading chunk 5/94: ..."
+    local total_chunks total_gb current
+    total_chunks=$(docker logs "$CONTAINER_NAME" 2>&1 | grep -oP 'Downloading chunked snapshot: \K\d+(?= chunks)' | tail -1)
+    total_gb=$(docker logs "$CONTAINER_NAME" 2>&1 | grep -oP 'Downloading chunked snapshot: \d+ chunks, \K[0-9.]+(?= GB)' | tail -1)
+    current=$(docker logs "$CONTAINER_NAME" 2>&1 | grep -oP 'Downloading chunk \K\d+(?=/\d+)' | tail -1)
+    echo "${current:-0} ${total_chunks:-0} ${total_gb:-0}"
+}
+
+get_snapshot_downloaded_bytes() {
+    # Sum: extracted chunks (current-1) * 512MB + bytes currently in .snap-chunks dir
+    local volume_path chunk_dir legacy_file info current total_chunks chunk_bytes inflight
+    volume_path=$(docker volume inspect qubic-lite_qubic-lite-data --format '{{.Mountpoint}}' 2>/dev/null || true)
+    [ -z "$volume_path" ] && { echo 0; return; }
+
+    chunk_dir="${volume_path}/.snap-chunks"
+    legacy_file="${volume_path}/snapshot.tar.zst"
+
+    if [ -d "$chunk_dir" ]; then
+        info=$(get_snapshot_chunk_info)
+        current=$(echo "$info" | awk '{print $1}')
+        inflight=$(du -sb "$chunk_dir" 2>/dev/null | awk '{print $1}')
+        inflight=${inflight:-0}
+        if [ "$current" -gt 0 ] 2>/dev/null; then
+            # (current - 1) full chunks already extracted, current is in progress
+            chunk_bytes=$(( (current - 1) * 512 * 1024 * 1024 + inflight ))
+            echo "$chunk_bytes"
+        else
+            echo "$inflight"
+        fi
+    elif [ -f "$legacy_file" ]; then
+        stat -c%s "$legacy_file" 2>/dev/null || echo 0
+    else
+        echo 0
     fi
 }
 
-check_snapshot_progress() {
-    local volume_path snap_file snap_size total_size pct bar filled empty
+get_snapshot_total_bytes() {
+    local total_gb
+    total_gb=$(get_snapshot_chunk_info | awk '{print $3}')
+    if [ -n "$total_gb" ] && [ "$total_gb" != "0" ]; then
+        awk "BEGIN {printf \"%.0f\", $total_gb * 1024 * 1024 * 1024}"
+    fi
+}
+
+snapshot_download_active() {
+    local volume_path
     volume_path=$(docker volume inspect qubic-lite_qubic-lite-data --format '{{.Mountpoint}}' 2>/dev/null || true)
     [ -z "$volume_path" ] && return 1
+    [ -d "${volume_path}/.snap-chunks" ] || [ -f "${volume_path}/snapshot.tar.zst" ]
+}
 
-    snap_file="${volume_path}/snapshot.tar.zst"
-    [ ! -f "$snap_file" ] && return 1
+check_snapshot_progress() {
+    local snap_size total_size pct bar filled empty snap_gb total_gb
+    snapshot_download_active || return 1
 
-    snap_size=$(stat -c%s "$snap_file" 2>/dev/null || echo 0)
+    snap_size=$(get_snapshot_downloaded_bytes)
     [ "$snap_size" -eq 0 ] && return 1
 
-    total_size=$(get_snapshot_total_size)
+    total_size=$(get_snapshot_total_bytes)
 
     if [ -z "$total_size" ] || [ "$total_size" -eq 0 ] 2>/dev/null; then
         local snap_mb=$((snap_size / 1024 / 1024))
@@ -340,11 +382,9 @@ check_snapshot_progress() {
     pct=$((snap_size * 100 / total_size))
     [ "$pct" -gt 100 ] && pct=100
 
-    local snap_gb total_gb
     snap_gb=$(awk "BEGIN {printf \"%.1f\", $snap_size / 1024 / 1024 / 1024}")
     total_gb=$(awk "BEGIN {printf \"%.1f\", $total_size / 1024 / 1024 / 1024}")
 
-    # Progress bar (30 chars wide)
     filled=$((pct * 30 / 100))
     empty=$((30 - filled))
     bar=$(printf '%0.s█' $(seq 1 $filled 2>/dev/null) || true)
@@ -356,26 +396,22 @@ check_snapshot_progress() {
 }
 
 watch_snapshot_progress() {
-    local volume_path snap_file total_size
-    volume_path=$(docker volume inspect qubic-lite_qubic-lite-data --format '{{.Mountpoint}}' 2>/dev/null || true)
-    [ -z "$volume_path" ] && { log_error "Volume not found"; return 1; }
-
-    snap_file="${volume_path}/snapshot.tar.zst"
-    if [ ! -f "$snap_file" ]; then
+    local total_size
+    if ! snapshot_download_active; then
         log_info "No snapshot download in progress"
         return 1
     fi
 
     log_info "Fetching snapshot size..."
-    total_size=$(get_snapshot_total_size)
+    total_size=$(get_snapshot_total_bytes)
 
     echo ""
     echo -e "  ${YELLOW}Snapshot download (Ctrl+C to stop)${NC}"
     echo ""
 
-    while [ -f "$snap_file" ]; do
+    while snapshot_download_active; do
         local snap_size pct snap_gb total_gb filled empty bar
-        snap_size=$(stat -c%s "$snap_file" 2>/dev/null || echo 0)
+        snap_size=$(get_snapshot_downloaded_bytes)
 
         if [ -n "$total_size" ] && [ "$total_size" -gt 0 ] 2>/dev/null; then
             pct=$((snap_size * 100 / total_size))
@@ -394,7 +430,6 @@ watch_snapshot_progress() {
             printf "\r  ${YELLOW}Downloading... ${snap_mb} MB${NC}  "
         fi
 
-        # Check if download finished (file removed after extraction)
         sleep 3
     done
 
@@ -544,7 +579,7 @@ do_logs() {
         return 1
     fi
     log_info "Showing logs (Ctrl+C to exit)..."
-    docker logs -f "$CONTAINER_NAME"
+    docker logs --tail 100 -f "$CONTAINER_NAME"
 }
 
 do_stop() {
