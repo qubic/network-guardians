@@ -152,6 +152,12 @@ get_network_tick() {
     [ -n "$resp" ] && echo "$resp" | grep -oP '"tick":\K[0-9]+' | head -1
 }
 
+get_network_initial_tick() {
+    local resp
+    resp=$(curl -sf --max-time 5 "$NETWORK_RPC" 2>/dev/null || true)
+    [ -n "$resp" ] && echo "$resp" | grep -oP '"initialTick":\K[0-9]+' | head -1
+}
+
 get_local_tick() {
     local resp
     resp=$(curl -sf --max-time 5 "http://localhost:${HTTP_PORT}/tick-info" 2>/dev/null || true)
@@ -442,7 +448,11 @@ do_status() {
     if container_running; then
         trap 'echo ""; return 0' INT
 
-        local tick_prev=""
+        local interval=3
+        local hist_max=60   # ~3min rolling window
+        local min_warmup=10 # need >=30s before first ETA
+        local -a behind_hist time_hist node_hist
+        local initial_tick=""
         while true; do
             clear
             print_logo
@@ -451,8 +461,9 @@ do_status() {
             docker ps --filter "name=${CONTAINER_NAME}" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
             docker ps --filter "name=watchtower-lite" --format "table {{.Names}}\t{{.Status}}" 2>/dev/null || true
 
-            local tick_now
+            local tick_now now_ts
             tick_now=$(get_local_tick)
+            now_ts=$(date +%s)
 
             if [ -z "$tick_now" ]; then
                 echo ""
@@ -460,28 +471,28 @@ do_status() {
                     log_warn "HTTP not responding on port ${HTTP_PORT}"
                 fi
                 echo ""
-                echo -e "  ${BLUE}Refreshing every 3s... (Ctrl+C to exit)${NC}"
-                tick_prev=""
-                sleep 3
+                echo -e "  ${BLUE}Refreshing every ${interval}s... (Ctrl+C to exit)${NC}"
+                behind_hist=(); time_hist=(); node_hist=()
+                sleep "$interval"
                 continue
             fi
 
             local net_tick
             net_tick=$(get_network_tick)
+            [ -z "$initial_tick" ] && initial_tick=$(get_network_initial_tick)
 
             echo ""
             echo -e "  ${GREEN}=== Node Health ===${NC}"
             echo ""
 
-            # Determine if ticking (compare with previous reading)
             local ticking=false
-            if [ -n "$tick_prev" ] && [ "$tick_now" -gt "$tick_prev" ] 2>/dev/null; then
+            if [ ${#node_hist[@]} -ge 1 ] && [ "$tick_now" -gt "${node_hist[-1]}" ] 2>/dev/null; then
                 ticking=true
             fi
 
             if [ -n "$net_tick" ] && [ "$tick_now" -ge "$net_tick" ] 2>/dev/null; then
                 echo -e "  Status:    ${GREEN}● SYNCED${NC}"
-            elif [ -z "$tick_prev" ]; then
+            elif [ ${#node_hist[@]} -lt 1 ]; then
                 echo -e "  Status:    ${YELLOW}● CHECKING...${NC}"
             elif [ "$ticking" = true ]; then
                 echo -e "  Status:    ${YELLOW}● SYNCING${NC} (ticking)"
@@ -495,17 +506,41 @@ do_status() {
                 echo -e "  Net Tick:  $(format_number "$net_tick")"
 
                 local behind=$((net_tick - tick_now))
+
+                # append behind sample (catchup-rate is computed directly from behind delta,
+                # which removes net_tick RPC quantisation noise from the rate term)
+                behind_hist+=("$behind")
+                time_hist+=("$now_ts")
+                node_hist+=("$tick_now")
+                if [ ${#behind_hist[@]} -gt "$hist_max" ]; then
+                    behind_hist=("${behind_hist[@]:1}")
+                    time_hist=("${time_hist[@]:1}")
+                    node_hist=("${node_hist[@]:1}")
+                fi
+                local samples=${#behind_hist[@]}
+
                 if [ "$behind" -gt 0 ]; then
                     local pct
-                    pct=$(awk "BEGIN {printf \"%.1f\", $tick_now * 100 / $net_tick}")
+                    if [ -n "$initial_tick" ] && [ "$net_tick" -gt "$initial_tick" ]; then
+                        pct=$(awk "BEGIN {printf \"%.2f\", ($tick_now - $initial_tick) * 100 / ($net_tick - $initial_tick)}")
+                    else
+                        pct=$(awk "BEGIN {printf \"%.4f\", $tick_now * 100 / $net_tick}")
+                    fi
                     echo -e "  Behind:    $(format_number "$behind") ticks (${pct}% synced)"
 
-                    # ETA based on measured tick rate
-                    if [ "$ticking" = true ] && [ -n "$tick_prev" ]; then
-                        local rate=$((tick_now - tick_prev))
-                        if [ "$rate" -gt 0 ]; then
-                            local eta_sec=$((behind * 3 / rate))
-                            echo -e "  ETA:       ${CYAN}$(format_eta "$eta_sec")${NC}"
+                    if [ "$samples" -lt "$min_warmup" ]; then
+                        echo -e "  ETA:       ${YELLOW}warming up ($((min_warmup - samples))s)${NC}"
+                    else
+                        # use real wall-clock elapsed (not assumed interval)
+                        local elapsed=$(( now_ts - time_hist[0] ))
+                        local closed=$(( behind_hist[0] - behind ))
+                        if [ "$elapsed" -gt 0 ] && [ "$closed" -gt 0 ]; then
+                            local eta_sec=$((behind * elapsed / closed))
+                            local rate_per_min
+                            rate_per_min=$(awk "BEGIN {printf \"%.1f\", $closed * 60 / $elapsed}")
+                            echo -e "  ETA:       ${CYAN}$(format_eta "$eta_sec")${NC}  ${BLUE}(${rate_per_min} t/min, ${elapsed}s avg)${NC}"
+                        elif [ "$closed" -le 0 ]; then
+                            echo -e "  ETA:       ${RED}∞ (not catching up)${NC}  ${BLUE}(${elapsed}s avg)${NC}"
                         fi
                     fi
                 fi
@@ -514,10 +549,9 @@ do_status() {
             fi
 
             echo ""
-            echo -e "  ${BLUE}Refreshing every 3s... (Ctrl+C to exit)${NC}"
+            echo -e "  ${BLUE}Refreshing every ${interval}s... (Ctrl+C to exit)${NC}"
 
-            tick_prev="$tick_now"
-            sleep 3
+            sleep "$interval"
         done
     elif container_exists; then
         log_warn "Lite node is stopped"
