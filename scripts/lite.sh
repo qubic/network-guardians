@@ -814,16 +814,7 @@ do_deploy() {
 
     cd "${DATA_DIR}" && docker compose down && docker compose up -d
 
-    # Stop watchtower if custom tag (would revert to latest)
-    if [ "$tag" != "latest" ]; then
-        docker stop watchtower-lite &>/dev/null || true
-        log_warn "Watchtower stopped (would revert to :latest)"
-    else
-        docker start watchtower-lite &>/dev/null || true
-        log_ok "Watchtower enabled"
-    fi
-
-    log_ok "Deployed ${DOCKER_IMAGE}:${tag}"
+    log_ok "Deployed ${DOCKER_IMAGE}:${tag} (watchtower will auto-update digest changes within this tag)"
 }
 
 do_update() {
