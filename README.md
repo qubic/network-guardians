@@ -228,3 +228,6 @@ Need help? Join the Qubic Discord: [discord.gg/G8qxTddTec](https://discord.gg/G8
 | Guardians Dashboard | [guardians.qubic.org](https://guardians.qubic.org/nodes) |
 | Bob Node | [GitHub](https://github.com/qubic/core-bob) |
 | Lite Node | [GitHub](https://github.com/qubic/core-lite) |
+
+---
+<p align="center"><sub> LICENSED UNDER ANTI-MILITARY LICENSE</sub></p>
