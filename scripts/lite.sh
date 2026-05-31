@@ -39,6 +39,10 @@ HTTP_PORT=41841
 # Public RPC
 NETWORK_RPC="https://rpc.qubic.org/v1/tick-info"
 
+# Self-update / new Guardian dashboard
+LITE_SH_URL="https://raw.githubusercontent.com/qubic/network-guardians/main/scripts/lite.sh"
+GUARDIAN_PY_URL="https://raw.githubusercontent.com/qubic/network-guardians/main/scripts/lite-guardian.py"
+
 # --- Colors ---
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -61,7 +65,11 @@ print_usage() {
     echo "  Interactive:  $0"
     echo "  CLI:          $0 <command> [options]"
     echo ""
+    echo "Default (no command): opens the Guardian dashboard once a node is installed."
+    echo ""
     echo "Commands:"
+    echo "  dashboard     Open the new Guardian dashboard (lite-guardian.py)"
+    echo "  old           Open the classic text menu (fallback)"
     echo "  install       Install and start Lite node"
     echo "  uninstall     Remove Lite node and data"
     echo "  status        Show container status"
@@ -818,13 +826,12 @@ do_deploy() {
 }
 
 do_update() {
-    local update_url tmp_file
-    update_url="https://raw.githubusercontent.com/qubic/network-guardians/main/scripts/lite.sh"
+    local tmp_file
     tmp_file=$(mktemp)
 
     log_info "Checking for updates..."
 
-    if ! curl -sfL --max-time 15 -o "$tmp_file" "$update_url"; then
+    if ! curl -sfL --max-time 15 -o "$tmp_file" "$LITE_SH_URL"; then
         rm -f "$tmp_file"
         log_error "Failed to download update"
         return 1
@@ -837,18 +844,102 @@ do_update() {
         return 1
     fi
 
-    # Check if there are changes
+    # Apply lite.sh update (if changed)
     if cmp -s "$SCRIPT_PATH" "$tmp_file"; then
         rm -f "$tmp_file"
-        log_ok "Already up to date"
-        return 0
+        log_ok "lite.sh already up to date"
+    else
+        chmod +x "$tmp_file"
+        mv "$tmp_file" "$SCRIPT_PATH"
+        log_ok "lite.sh updated"
     fi
 
-    # Apply update
-    chmod +x "$tmp_file"
-    mv "$tmp_file" "$SCRIPT_PATH"
-    log_ok "Updated successfully!"
+    # Install/refresh the new Guardian dashboard: fetch lite-guardian.py from git,
+    # chmod +x, and set up the python venv + deps — everything it needs.
+    install_guardian || true
+
     log_info "Restart the script to use the new version"
+}
+
+# --- New Guardian dashboard (lite-guardian.py) ---
+
+guardian_paths() {
+    SCRIPT_HOME=$(dirname "$SCRIPT_PATH")
+    GUARDIAN_PY="${SCRIPT_HOME}/lite-guardian.py"
+    GUARDIAN_VENV="${SCRIPT_HOME}/.venv"
+}
+
+# Download lite-guardian.py from git + chmod +x. Returns 1 on failure.
+download_guardian_py() {
+    guardian_paths
+    local tmp
+    tmp=$(mktemp)
+    if curl -sfL --max-time 20 -o "$tmp" "$GUARDIAN_PY_URL" && head -1 "$tmp" | grep -q 'python'; then
+        if cmp -s "$GUARDIAN_PY" "$tmp" 2>/dev/null; then
+            rm -f "$tmp"
+            log_ok "Dashboard already up to date"
+        else
+            mv "$tmp" "$GUARDIAN_PY"
+            chmod u+x "$GUARDIAN_PY" 2>/dev/null || true
+            log_ok "Dashboard installed (lite-guardian.py)"
+        fi
+        return 0
+    fi
+    rm -f "$tmp"
+    log_warn "Could not fetch dashboard (lite-guardian.py) from git"
+    return 1
+}
+
+# Create/refresh the python venv with the dashboard deps. Returns 1 on failure.
+ensure_venv() {
+    guardian_paths
+    if ! command -v python3 >/dev/null 2>&1; then
+        log_warn "python3 not found (needed for the dashboard)"
+        return 1
+    fi
+    if [ -x "${GUARDIAN_VENV}/bin/python" ] && "${GUARDIAN_VENV}/bin/python" -c 'import textual' 2>/dev/null; then
+        return 0
+    fi
+    log_info "Setting up dashboard environment (~30s)..."
+    if ! python3 -m venv "$GUARDIAN_VENV" 2>/dev/null; then
+        if command -v apt-get >/dev/null 2>&1; then
+            apt-get update -y >/dev/null 2>&1 || true
+            apt-get install -y python3-venv >/dev/null 2>&1 || true
+        fi
+        python3 -m venv "$GUARDIAN_VENV" || { log_warn "venv creation failed"; return 1; }
+    fi
+    "${GUARDIAN_VENV}/bin/pip" install --quiet --upgrade pip >/dev/null 2>&1 || true
+    if ! "${GUARDIAN_VENV}/bin/pip" install --quiet 'textual>=0.80,<1' rich; then
+        log_warn "Failed to install dashboard dependencies"
+        return 1
+    fi
+    return 0
+}
+
+# Full install used by 'update' (option 13): dashboard + deps + chmod.
+install_guardian() {
+    download_guardian_py || return 1
+    ensure_venv || return 1
+    log_ok "Dashboard ready — next './lite.sh' opens it"
+}
+
+launch_guardian() {
+    guardian_paths
+    # Not installed yet -> classic menu. 'update' (option 13) installs it.
+    if [ ! -f "$GUARDIAN_PY" ]; then
+        log_info "New dashboard not installed yet — opening the classic menu."
+        log_info "Run 'update' (option 13) to install the dashboard, then restart."
+        interactive_menu
+        return
+    fi
+    if ! ensure_venv; then
+        log_warn "Dashboard dependencies missing — opening the classic menu."
+        log_info "Run 'update' (option 13) to (re)install, then restart."
+        interactive_menu
+        return
+    fi
+    exec "${GUARDIAN_VENV}/bin/python" "$GUARDIAN_PY" \
+        --lite-script "$SCRIPT_PATH" --http-port "$HTTP_PORT"
 }
 
 interactive_install() {
@@ -945,12 +1036,24 @@ interactive_menu() {
 
 # --- Main ---
 
+# When sourced (e.g. by lite-test.sh dashboard) only load the functions/config
+# above; skip the CLI/menu below.
+if [ "${BASH_SOURCE[0]}" != "${0}" ]; then
+    return 0 2>/dev/null || true
+fi
+
 OPERATOR_SEED=""
 OPERATOR_ALIAS=""
 
 # Parse arguments
 if [ $# -eq 0 ]; then
-    interactive_menu
+    # Installed node  -> new Guardian dashboard
+    # Fresh machine    -> classic install menu (familiar first-run flow)
+    if container_exists || [ -f "${DATA_DIR}/docker-compose.yml" ]; then
+        launch_guardian
+    else
+        interactive_menu
+    fi
     exit 0
 fi
 
@@ -986,6 +1089,8 @@ case "$COMMAND" in
     update)       do_update ;;
     deploy)       do_deploy ;;
     watch)        watch_snapshot_progress ;;
+    dashboard|guardian|ui) launch_guardian ;;
+    old|-old|--old|menu)   interactive_menu ;;
     help|--help|-h) print_usage ;;
     *)          log_error "Unknown command: $COMMAND"; print_usage; exit 1 ;;
 esac
