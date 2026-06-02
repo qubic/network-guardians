@@ -37,6 +37,11 @@ import urllib.request
 from collections.abc import AsyncIterator
 from typing import Any
 
+# Force 24-bit colour: ssh sessions rarely forward COLORTERM (sshd AcceptEnv omits it),
+# so without this Textual/Rich downsample the brand palette to a dull 256-colour
+# approximation. setdefault keeps any real value the terminal already provides.
+os.environ.setdefault("COLORTERM", "truecolor")
+
 # ─── Dependency Check ─────────────────────────────────────────────────────────
 
 REQUIRED_PYTHON = (3, 10)
@@ -130,7 +135,8 @@ QUBIC_SURFACE = "#2a2b31"
 QUBIC_CORAL = "#fc997a"
 QUBIC_MINT = "#d2fdd1"
 QUBIC_TEXT = "#d2d6db"
-QUBIC_DIM = "#6c737f"
+QUBIC_LABEL = "#b4bcc8"   # left-column labels: bright enough to read on the dark bg
+QUBIC_DIM = "#7d8590"     # units / annotations / bar track: visible but subordinate
 QUBIC_BORDER = "#3a3b42"
 QUBIC_TEAL = "#32d9d9"
 QUBIC_RED = "#ff4444"
@@ -333,6 +339,13 @@ RE_QTICK = re.compile(r"^\d{12}\s+\d{3}:\d{3}\(\d{3}\)\.([\d']+)\.(\d+)")
 RE_CONN = re.compile(r"^\[[+-][\d']+\s+[+-][\d']+\s+\*([\d']+)\s+/([\d']+)\]\s+([\d']+)\|([\d']+)")
 # pure per-tick performance spam — hidden unless raw-log mode is on
 RE_NOISE = re.compile(r"Main loop duration|Ticker loop duration|^\d+\s*\|\s*Tick\s*=|^\[[+-]\d")
+# snapshot bootstrap (runs before the node starts ticking): chunked download + interleaved extract.
+# "Downloading chunked snapshot: 182 chunks, 90.54 GB (parallel=3)"
+RE_SNAP_TOTAL = re.compile(r"Downloading chunked snapshot: (\d+) chunks, ([\d.]+) GB")
+# "  chunk 7/182 done (3.50/90.54 GB, download 10.3 MB/s aggregate, extract 80.2 MB/s)"
+RE_SNAP_DONE = re.compile(r"chunk (\d+)/(\d+) done \(([\d.]+)/([\d.]+) GB, download ([\d.]+) MB/s")
+# "Downloading chunk 30/182: ep215-…" — the chunk just *started* (parallel=3 leads 'done' by ~3)
+RE_SNAP_FETCH = re.compile(r"Downloading chunk (\d+)/\d+:")
 
 
 def _num(s: str) -> int:
@@ -414,7 +427,7 @@ class _RowPanel(Static):
 
     def set_row(self, row_id: str, label: str, value: str) -> None:
         self.query_one(f"#{row_id}", Static).update(
-            f"[{QUBIC_DIM}]{label:<{self.LABEL_W}}[/] {value}"
+            f"[{QUBIC_LABEL}]{label:<{self.LABEL_W}}[/] {value}"
         )
 
     def set_line(self, row_id: str, markup: str) -> None:
@@ -437,8 +450,20 @@ class NodePanel(_RowPanel):
         self.set_row("nd-conns", "Connections",
                      f"[{QUBIC_TEXT}]{active}[/][{QUBIC_DIM}] active / {total} known[/]")
 
-    def update_local(self, container_state: str, status: dict | None, tick: dict | None) -> None:
-        self.set_line("nd-container", f"[{QUBIC_DIM}]{'Container':<{self.LABEL_W}}[/] {container_state}")
+    def set_health_snapshot(self, snap: dict) -> None:
+        """Short health line while bootstrapping from a chunked snapshot — the
+        full progress + ETA live in the (otherwise idle) SYNC panel, which has
+        the width for it. The NODE panel is only ~half the row, so keep it tight."""
+        c = HEALTH_COLORS["saving_snapshot"]
+        i = HEALTH_ICONS["saving_snapshot"]
+        done, total = snap["done"], snap["total"]
+        chunk, chunks = snap["chunk"], snap["chunks"]
+        txt = "applying snapshot…" if chunks and chunk >= chunks else f"snapshot {done:.0f}/{total:.0f} GB"
+        self.set_row("nd-health", "Health", f"[{c}]{i} {txt}[/]")
+
+    def update_local(self, container_state: str, status: dict | None, tick: dict | None,
+                     snap: dict | None = None) -> None:
+        self.set_line("nd-container", f"[{QUBIC_LABEL}]{'Container':<{self.LABEL_W}}[/] {container_state}")
         extra = (tick or {}).get("extraInfo", {}) if tick else {}
         alias = extra.get("alias") or "-"
         operator = extra.get("operator") or "-"
@@ -454,6 +479,9 @@ class NodePanel(_RowPanel):
             c = HEALTH_COLORS.get(health, QUBIC_DIM)
             i = HEALTH_ICONS.get(health, "?")
             self.set_row("nd-health", "Health", f"[{c}]{i} {health}[/]")
+        elif snap:
+            # API not up yet because the node is still pulling its snapshot
+            self.set_health_snapshot(snap)
         elif not tick:
             self.set_row("nd-health", "Health", f"[{QUBIC_DIM}]unreachable[/]")
 
@@ -491,13 +519,37 @@ class SyncPanel(_RowPanel):
             self.set_row("sy-state", "State", f"[{QUBIC_MINT}]● SYNCED[/]  [{QUBIC_DIM}](≤{SYNC_BUFFER} buffer → sync score 100)[/]")
             self.set_row("sy-behind", "Behind", f"[{QUBIC_MINT}]{behind}[/] ticks")
             self.set_row("sy-eta", "ETA", f"[{QUBIC_MINT}]in sync[/]")
-            self.set_line("sy-bar", f"[{QUBIC_DIM}]{'Sync':<{self.LABEL_W}}[/] {_bar(100, 30, QUBIC_MINT)} 100%")
+            self.set_line("sy-bar", f"[{QUBIC_LABEL}]{'Sync':<{self.LABEL_W}}[/] {_bar(100, 30, QUBIC_MINT)} 100%")
         else:
             self.set_row("sy-state", "State", f"[{QUBIC_CREAM}]● SYNCING[/]")
             self.set_row("sy-behind", "Behind", f"[{QUBIC_CORAL}]{_fmt_tick(behind)}[/] ticks")
             self.set_row("sy-eta", "ETA", f"[{QUBIC_CYAN}]{eta_text or 'warming up…'}[/]")
             pct = 100.0 * node_tick / ref_tick if ref_tick else 0
-            self.set_line("sy-bar", f"[{QUBIC_DIM}]{'Sync':<{self.LABEL_W}}[/] {_bar(pct, 30, QUBIC_CYAN)} {pct:.2f}%")
+            self.set_line("sy-bar", f"[{QUBIC_LABEL}]{'Sync':<{self.LABEL_W}}[/] {_bar(pct, 30, QUBIC_CYAN)} {pct:.2f}%")
+
+    def update_snapshot(self, snap: dict) -> None:
+        """Repurpose the (idle) SYNC rows to show snapshot-download progress + a
+        running ETA while the node isn't ticking yet. Labels revert on the next
+        update_sync() call, so this cleanly vanishes once the snapshot is done."""
+        done, total = snap["done"], snap["total"]
+        chunk, chunks, rate, eta = snap["chunk"], snap["chunks"], snap["rate"], snap.get("eta")
+        applying = bool(chunks) and chunk >= chunks
+        pct = 100.0 * done / total if total else 0.0
+        self.set_row("sy-state", "State",
+                     f"[{QUBIC_CREAM}]◔ {'applying snapshot…' if applying else 'restoring from snapshot'}[/]")
+        self.set_row("sy-epoch", "Epoch", f"[{QUBIC_DIM}]-[/]")
+        fetching = snap.get("fetching", 0)
+        lead = f"[{QUBIC_DIM}]  ·{fetching} loading[/]" if fetching > chunk else ""
+        self.set_row("sy-node", "Chunks", f"[bold {QUBIC_CYAN}]{chunk}[/][{QUBIC_DIM}] / {chunks}[/]{lead}")
+        self.set_row("sy-ref", "Downloaded", f"[{QUBIC_TEXT}]{done:.1f}[/][{QUBIC_DIM}] / {total:.1f} GB[/]")
+        self.set_row("sy-behind", "Speed", f"[{QUBIC_TEXT}]{rate:.0f}[/][{QUBIC_DIM}] MB/s[/]")
+        if applying:
+            self.set_row("sy-eta", "ETA", f"[{QUBIC_CREAM}]almost done…[/]")
+        elif eta:
+            self.set_row("sy-eta", "ETA", f"[bold {QUBIC_CYAN}]{_fmt_eta(eta)}[/] [{QUBIC_DIM}]left[/]")
+        else:
+            self.set_row("sy-eta", "ETA", f"[{QUBIC_DIM}]calculating…[/]")
+        self.set_line("sy-bar", f"[{QUBIC_LABEL}]{'Progress':<{self.LABEL_W}}[/] {_bar(pct, 30, QUBIC_CREAM)} {pct:.0f}%")
 
 
 class GuardianPanel(_RowPanel):
@@ -581,20 +633,22 @@ ACTION_BUTTONS = [
     ("uninstall", "✖ Uninstall", "Remove containers AND data directory (irreversible)"),
 ]
 ACTION_DANGER = {"stop", "reset", "uninstall"}
+# actions that bring the node down→up: drop the stale tick so SYNC re-initialises
+ACTION_RESETS_SYNC = {"restart", "start", "reset", "reconfigure", "deploy", "install"}
 
 
 class ActionsPanel(Static):
     DEFAULT_CSS = f"""
     ActionsPanel {{ {_PANEL_CSS} padding: 1 2; }}
-    ActionsPanel .button-row {{ height: 1; layout: horizontal; width: 100%; margin-bottom: 1; }}
+    ActionsPanel .button-row {{ height: 3; layout: horizontal; width: 100%; margin-bottom: 1; }}
     ActionsPanel Button {{
-        margin: 0 1 0 0; width: 1fr; height: 1; min-width: 0;
-        background: {QUBIC_SURFACE}; color: {QUBIC_TEXT}; border: none;
+        margin: 0 1 0 0; width: 1fr; height: 3; min-width: 0;
+        background: {QUBIC_SURFACE}; color: {QUBIC_TEXT}; border: round {QUBIC_BORDER};
     }}
-    ActionsPanel Button:hover {{ background: {QUBIC_TEAL}; color: {QUBIC_DARK}; }}
-    ActionsPanel Button:focus {{ background: {QUBIC_TEAL}; color: {QUBIC_DARK}; }}
-    ActionsPanel .danger {{ background: #3d1a1a; color: {QUBIC_CORAL}; }}
-    ActionsPanel .danger:hover {{ background: {QUBIC_CORAL}; color: {QUBIC_DARK}; }}
+    ActionsPanel Button:hover {{ background: {QUBIC_TEAL}; color: {QUBIC_DARK}; border: round {QUBIC_TEAL}; }}
+    ActionsPanel Button:focus {{ background: {QUBIC_TEAL}; color: {QUBIC_DARK}; border: round {QUBIC_CYAN}; }}
+    ActionsPanel .danger {{ background: #3d1a1a; color: {QUBIC_CORAL}; border: round {QUBIC_CORAL}; }}
+    ActionsPanel .danger:hover {{ background: {QUBIC_CORAL}; color: {QUBIC_DARK}; border: round {QUBIC_CORAL}; }}
     """
 
     class Action(Message):
@@ -815,8 +869,12 @@ class LogScreen(ModalScreen[None]):
     @work(exclusive=True, group="fulllog")
     async def _pump(self) -> None:
         rl = self.query_one("#full-log", RichLog)
+        n = 0
         try:
             async for line in self._streamer.stream():
+                n += 1
+                if n % 50 == 0:
+                    await asyncio.sleep(0)  # yield: a log burst must not starve input/render
                 entry = parse_log(line)
                 if entry is None or not entry.text:
                     continue
@@ -894,6 +952,8 @@ class GuardianApp(App):
         self._eta_text: str | None = None
         # sync ETA history: (timestamp, behind)
         self._behind_hist: list[tuple[float, int]] = []
+        # snapshot bootstrap progress (None unless a chunked download is running)
+        self._snap: dict | None = None
 
     def get_css_variables(self) -> dict[str, str]:
         return QUBIC_THEME.generate()
@@ -960,7 +1020,7 @@ class GuardianApp(App):
 
             self._connected = bool(status or tick)
             self._set_conn()
-            node_panel.update_local(cstate, status, tick)
+            node_panel.update_local(cstate, status, tick, self._snap)
 
             # capture operator for the guardian lookup
             if not self._operator and tick:
@@ -986,12 +1046,29 @@ class GuardianApp(App):
             self._render_sync()
             await asyncio.sleep(3)
 
+    def _reset_sync_state(self) -> None:
+        """A lifecycle action is restarting the node — drop the stale tick so the
+        SYNC panel re-initialises from the fresh container instead of freezing on
+        the pre-restart values (node tick is monotonic, so without this a restart
+        would never show). The next poll / log line rebuilds it."""
+        self._node_tick = None
+        self._epoch = None
+        self._eta_text = None
+        self._behind_hist.clear()
+        self._snap = None
+        self._render_sync()
+
     def _render_sync(self) -> None:
         try:
             sp = self.query_one(SyncPanel)
         except Exception:
             return
-        sp.update_sync(self._node_tick, self._ref_tick, self._epoch, self._eta_text)
+        # while a snapshot is being pulled the node isn't ticking — show the
+        # download progress + ETA here instead of an empty SYNC panel
+        if self._snap and not self._node_tick:
+            sp.update_snapshot(self._snap)
+        else:
+            sp.update_sync(self._node_tick, self._ref_tick, self._epoch, self._eta_text)
 
     def _eta(self, node_tick: int | None, ref: int | None) -> str | None:
         if not node_tick or not ref:
@@ -1049,17 +1126,26 @@ class GuardianApp(App):
             node_panel = self.query_one(NodePanel)
         except Exception:
             return
+        n = 0
         try:
             async for line in self._streamer.stream():
+                n += 1
+                if n % 50 == 0:
+                    await asyncio.sleep(0)  # yield: a log burst must not starve input/render
                 entry = parse_log(line)
                 if entry is None or not entry.text:
                     continue
                 # the log is the freshest tick source — keep the SYNC panel live
-                if entry.tick and (self._node_tick is None or entry.tick > self._node_tick):
-                    self._node_tick = entry.tick
-                    if entry.epoch:
-                        self._epoch = entry.epoch
-                    self._render_sync()
+                if entry.tick:
+                    if self._node_tick is None or entry.tick > self._node_tick:
+                        self._node_tick = entry.tick
+                        if entry.epoch:
+                            self._epoch = entry.epoch
+                        self._render_sync()
+                    self._snap = None  # node is ticking → snapshot bootstrap done
+                else:
+                    # before the node ticks it may be pulling a chunked snapshot
+                    self._scan_snapshot(entry.text, node_panel)
                 # pull live peer/connection counts out of the per-tick line
                 if entry.conns and entry.peers:
                     node_panel.update_net(entry.conns, entry.peers)
@@ -1071,6 +1157,40 @@ class GuardianApp(App):
             pass
         except Exception as e:
             log_panel.write_note(f"[{QUBIC_CORAL}]log stream error: ", str(e))
+
+    def _scan_snapshot(self, text: str, node_panel: NodePanel) -> None:
+        """Pull chunked-snapshot progress out of a log line and surface it as the
+        node Health (the HTTP API isn't up yet, so it'd otherwise read 'unreachable')."""
+        m = RE_SNAP_DONE.search(text)
+        if m:
+            chunk, chunks, done, total, rate = (int(m.group(1)), int(m.group(2)),
+                                                float(m.group(3)), float(m.group(4)), float(m.group(5)))
+            prev = self._snap or {}
+            # the reported aggregate rate is jumpy (9–35 MB/s) — smooth it for a stable ETA
+            rates = (prev.get("rates", []) + [rate])[-8:]
+            avg = sum(rates) / len(rates)
+            eta = int((total - done) * 1024 / avg) if avg > 0 and chunk < chunks else None
+            self._snap = {"chunk": chunk, "chunks": chunks, "done": done, "total": total,
+                          "rate": rate, "rates": rates, "eta": eta,
+                          "fetching": max(chunk, prev.get("fetching", 0))}
+            node_panel.set_health_snapshot(self._snap)
+            self._render_sync()
+            return
+        m = RE_SNAP_FETCH.search(text)
+        if m and self._snap is not None:
+            # a chunk just *started* downloading — parallel=3, so this leads 'done' by ~3
+            f = int(m.group(1))
+            if f > self._snap.get("fetching", 0):
+                self._snap["fetching"] = f
+                self._render_sync()
+            return
+        m = RE_SNAP_TOTAL.search(text)
+        if m and self._snap is None:
+            chunks, total = m.groups()
+            self._snap = {"chunk": 0, "chunks": int(chunks), "done": 0.0,
+                          "total": float(total), "rate": 0.0, "rates": [], "eta": None, "fetching": 0}
+            node_panel.set_health_snapshot(self._snap)
+            self._render_sync()
 
     # ─── log / help actions ───────────────────────────────────────────────────
     def action_clear_logs(self) -> None:
@@ -1181,6 +1301,8 @@ class GuardianApp(App):
                            str(self._lite_script or os.path.join(DEFAULT_DATA_DIR, "lite.sh")))
             return
         self._action_running = True
+        if args and args[0] in ACTION_RESETS_SYNC:
+            self._reset_sync_state()
         log.write_note(f"[{QUBIC_TEAL}]» lite.sh {markup_escape(' '.join(args))}  ",
                        f"{label}" if label else "")
         try:
