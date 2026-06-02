@@ -16,7 +16,7 @@ It does NOT expose the low-level node console keys (drop connections, skip
 security, force epoch, …): those are not part of running a Guardian node and
 are dangerous to hit by accident.
 
-Requirements: pip install 'textual>=0.80,<1'  (lite-test.sh sets up a venv for you)
+Requirements: pip install 'textual>=0.80,<1'  (lite.sh sets up a venv for you)
 
 Usage:
     python3 lite-guardian.py
@@ -118,6 +118,7 @@ logger = logging.getLogger(__name__)
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
+BUILD = "ui9-groups"  # visible build marker (NODE ACTIONS title) to confirm the running version
 DEFAULT_DATA_DIR = "/opt/qubic-lite"
 DEFAULT_API_BASE = "https://guardians.qubic.org/api/v1"
 NETWORK_RPC = "https://rpc.qubic.org/v1/tick-info"
@@ -552,50 +553,82 @@ class SyncPanel(_RowPanel):
         self.set_line("sy-bar", f"[{QUBIC_LABEL}]{'Progress':<{self.LABEL_W}}[/] {_bar(pct, 30, QUBIC_CREAM)} {pct:.0f}%")
 
 
-class GuardianPanel(_RowPanel):
+class GuardianPanel(Static):
+    """Live Guardian score from guardians.qubic.org, in three columns:
+    STATUS (eligibility / epoch / checks) · SCORES · REWARD."""
     TITLE = "GUARDIAN  (guardians.qubic.org)"
-    LABEL_W = 16
-    ROWS = [
-        ("gd-eligible", "Eligible"), ("gd-final", "Final Score"), ("gd-uptime", "Uptime Score"),
-        ("gd-sync", "Sync Score"), ("gd-p2p", "P2P Score"), ("gd-checks", "Checks"),
-        ("gd-points", "Reward Points"), ("gd-reward", "Est. Reward"), ("gd-epoch", "Epoch"),
-    ]
+
+    DEFAULT_CSS = f"""
+    GuardianPanel {{ {_PANEL_CSS} }}
+    GuardianPanel #gd-cols {{ layout: horizontal; height: auto; }}
+    GuardianPanel .gd-col {{ width: 1fr; height: auto; }}
+    GuardianPanel .gd-col.mid {{ margin: 0 3; }}
+    GuardianPanel .gd-head {{ color: {QUBIC_CYAN}; text-style: bold; height: 1; }}
+    GuardianPanel .row {{ height: 1; }}
+    GuardianPanel .grow {{ height: auto; }}
+    """
+
+    def compose(self) -> ComposeResult:
+        self.border_title = f" {self.TITLE} "
+        with Horizontal(id="gd-cols"):
+            with Vertical(classes="gd-col"):
+                yield Static(f"[{QUBIC_CYAN}]STATUS[/]", classes="gd-head")
+                yield Static("", id="gd-eligible", classes="grow")
+                yield Static("", id="gd-epoch", classes="grow")
+                yield Static("", id="gd-checks", classes="row")
+            with Vertical(classes="gd-col mid"):
+                yield Static(f"[{QUBIC_CYAN}]SCORES[/]", classes="gd-head")
+                yield Static("", id="gd-final", classes="row")
+                yield Static("", id="gd-uptime", classes="row")
+                yield Static("", id="gd-sync", classes="row")
+                yield Static("", id="gd-p2p", classes="row")
+            with Vertical(classes="gd-col"):
+                yield Static(f"[{QUBIC_CYAN}]REWARD[/]", classes="gd-head")
+                yield Static("", id="gd-points", classes="row")
+                yield Static("", id="gd-reward", classes="row")
+
+    def _set(self, row_id: str, label: str, value: str, w: int = 9) -> None:
+        self.query_one(f"#{row_id}", Static).update(f"[{QUBIC_LABEL}]{label:<{w}}[/] {value}")
+
+    def _line(self, row_id: str, markup: str) -> None:
+        self.query_one(f"#{row_id}", Static).update(markup)
 
     def update_score(self, node: dict | None, stats: dict | None) -> None:
         if node is None:
-            self.set_line("gd-eligible", f"[{QUBIC_DIM}]node not yet tracked by Guardians (give it a few checks)[/]")
-            for rid, _ in self.ROWS[1:]:
-                self.set_line(rid, "")
+            self._line("gd-eligible", f"[{QUBIC_DIM}]node not yet tracked by Guardians[/]")
+            for rid in ("gd-epoch", "gd-checks", "gd-final", "gd-uptime",
+                        "gd-sync", "gd-p2p", "gd-points", "gd-reward"):
+                self._line(rid, "")
         else:
             flagged = node.get("flagged")
             eligible = node.get("eligibleForReward")
             if flagged:
-                self.set_row("gd-eligible", "Eligible", f"[{QUBIC_RED}]✖ FLAGGED[/] [{QUBIC_DIM}]{node.get('flaggedReason') or ''}[/]")
+                self._set("gd-eligible", "Eligible", f"[{QUBIC_RED}]✖ FLAGGED[/] [{QUBIC_DIM}]{node.get('flaggedReason') or ''}[/]")
             elif eligible:
-                self.set_row("gd-eligible", "Eligible", f"[{QUBIC_MINT}]✔ yes[/]")
+                self._set("gd-eligible", "Eligible", f"[{QUBIC_MINT}]✔ yes[/]")
             else:
                 reason = node.get("ineligibleReason") or "thresholds not met yet"
-                self.set_row("gd-eligible", "Eligible", f"[{QUBIC_CREAM}]… not yet[/] [{QUBIC_DIM}]{reason}[/]")
+                self._set("gd-eligible", "Eligible", f"[{QUBIC_CREAM}]… not yet[/] [{QUBIC_DIM}]{reason}[/]")
 
             ls = node.get("liveScore") or {}
             for rid, label, key in [
-                ("gd-final", "Final Score", "finalScore"),
-                ("gd-uptime", "Uptime Score", "uptimeScore"),
-                ("gd-sync", "Sync Score", "syncScore"),
-                ("gd-p2p", "P2P Score", "p2pScore"),
+                ("gd-final", "Final", "finalScore"),
+                ("gd-uptime", "Uptime", "uptimeScore"),
+                ("gd-sync", "Sync", "syncScore"),
+                ("gd-p2p", "P2P", "p2pScore"),
             ]:
                 v = ls.get(key)
                 if v is None:
-                    self.set_row(rid, label, "-")
+                    self._set(rid, label, "-", 7)
                 else:
-                    self.set_row(rid, label, f"[{_score_color(v)}]{v:.1f}[/] [{QUBIC_DIM}]/100[/]")
+                    self._set(rid, label, f"[{_score_color(v)}]{v:.1f}[/][{QUBIC_DIM}]/100[/]", 7)
 
             tc, sc = node.get("totalChecks", 0), node.get("successfulChecks", 0)
             tcol = QUBIC_MINT if tc >= 1500 else QUBIC_CREAM
-            self.set_row("gd-checks", "Checks", f"[{QUBIC_TEXT}]{sc}[/]/[{tcol}]{tc}[/] [{QUBIC_DIM}](need 1500)[/]")
-            self.set_row("gd-points", "Reward Points", f"[{QUBIC_TEXT}]{_fmt_tick(int(ls.get('rewardPoints', 0)))}[/]")
+            self._set("gd-checks", "Checks", f"[{QUBIC_TEXT}]{sc}[/]/[{tcol}]{tc}[/] [{QUBIC_DIM}](≥1500)[/]")
+            self._set("gd-points", "Points", f"[{QUBIC_TEXT}]{_fmt_tick(int(ls.get('rewardPoints', 0)))}[/]", 7)
             est = ls.get("estimatedReward")
-            self.set_row("gd-reward", "Est. Reward", f"[bold {QUBIC_CREAM}]{_fmt_tick(est)}[/] [{QUBIC_DIM}]QU[/]" if est else "-")
+            self._set("gd-reward", "Est.", f"[bold {QUBIC_CREAM}]{_fmt_tick(est)}[/] [{QUBIC_DIM}]QU[/]" if est else "-", 7)
 
         if stats:
             prog = stats.get("epochProgress", {})
@@ -605,13 +638,13 @@ class GuardianPanel(_RowPanel):
             phase = stats.get("epochPhase", {}).get("phase", "")
             txt = f"[{QUBIC_TEXT}]{ep}[/]"
             if pct is not None:
-                txt += f"  [{QUBIC_DIM}]{pct:.0f}% done"
+                txt += f" [{QUBIC_DIM}]{pct:.0f}%"
                 if rem:
-                    txt += f", {_fmt_eta(int(rem))} left"
+                    txt += f" · {_fmt_eta(int(rem))} left"
                 txt += "[/]"
             if phase and phase != "active":
-                txt += f"  [{QUBIC_CORAL}]{phase}[/]"
-            self.set_row("gd-epoch", "Epoch", txt)
+                txt += f" [{QUBIC_CORAL}]{phase}[/]"
+            self._set("gd-epoch", "Epoch", txt)
 
 
 # ─── Node Actions Panel (lite.sh lifecycle — NOT node console keys) ───────────────
@@ -635,20 +668,37 @@ ACTION_BUTTONS = [
 ACTION_DANGER = {"stop", "reset", "uninstall"}
 # actions that bring the node down→up: drop the stale tick so SYNC re-initialises
 ACTION_RESETS_SYNC = {"restart", "start", "reset", "reconfigure", "deploy", "install"}
+# grouped like the classic `lite.sh -old` menu (INSTALL · MANAGE · OTHER); each
+# group sits under a full-width divider header for a clear visual split. A group is
+# (name, rows); each row is up to 4 action ids, padded to 4 cols so widths align.
+ACTION_GROUPS = [
+    ("INSTALL", [["install", "uninstall"]]),
+    ("MANAGE",  [["start", "stop", "restart", "logs"],
+                 ["reconfigure", "snapshot", "watch", "reset"]]),
+    ("OTHER",   [["deploy", "update"]]),
+]
 
 
 class ActionsPanel(Static):
     DEFAULT_CSS = f"""
-    ActionsPanel {{ {_PANEL_CSS} padding: 1 2; }}
-    ActionsPanel .button-row {{ height: 3; layout: horizontal; width: 100%; margin-bottom: 1; }}
-    ActionsPanel Button {{
-        margin: 0 1 0 0; width: 1fr; height: 3; min-width: 0;
-        background: {QUBIC_SURFACE}; color: {QUBIC_TEXT}; border: round {QUBIC_BORDER};
+    ActionsPanel {{ {_PANEL_CSS} padding: 0 1; }}
+    ActionsPanel .button-row {{ height: 1; layout: horizontal; width: 100%; margin-bottom: 1; }}
+    ActionsPanel .group-head {{
+        width: 100%; height: 1; margin-bottom: 1; border-top: solid {QUBIC_BORDER};
+        border-title-color: {QUBIC_MINT}; border-title-style: bold; border-title-align: left;
     }}
-    ActionsPanel Button:hover {{ background: {QUBIC_TEAL}; color: {QUBIC_DARK}; border: round {QUBIC_TEAL}; }}
-    ActionsPanel Button:focus {{ background: {QUBIC_TEAL}; color: {QUBIC_DARK}; border: round {QUBIC_CYAN}; }}
-    ActionsPanel .danger {{ background: #3d1a1a; color: {QUBIC_CORAL}; border: round {QUBIC_CORAL}; }}
-    ActionsPanel .danger:hover {{ background: {QUBIC_CORAL}; color: {QUBIC_DARK}; border: round {QUBIC_CORAL}; }}
+    ActionsPanel .spacer {{ width: 1fr; height: 1; margin: 0 1 0 0; }}
+    ActionsPanel Button {{
+        margin: 0 1 0 0; width: 1fr; height: 1; min-width: 0; border: none;
+        background: {QUBIC_SURFACE}; color: {QUBIC_TEXT}; text-style: none;
+    }}
+    ActionsPanel Button:hover, ActionsPanel Button:focus {{
+        background: #0e6b6b; color: #ffffff; text-style: bold; border: none;
+    }}
+    ActionsPanel .danger {{ background: #3d1a1a; color: {QUBIC_CORAL}; }}
+    ActionsPanel .danger:hover, ActionsPanel .danger:focus {{
+        background: #7a1f1f; color: #ffffff; text-style: bold; border: none;
+    }}
     """
 
     class Action(Message):
@@ -657,14 +707,22 @@ class ActionsPanel(Static):
             self.action = action
 
     def compose(self) -> ComposeResult:
-        self.border_title = " NODE ACTIONS · lite.sh (hover for help · H) "
-        for i in range(0, len(ACTION_BUTTONS), 4):
-            with Horizontal(classes="button-row"):
-                for action_id, label, desc in ACTION_BUTTONS[i:i + 4]:
-                    btn = Button(label, id=f"act-{action_id}",
-                                 classes="danger" if action_id in ACTION_DANGER else "")
-                    btn.tooltip = desc
-                    yield btn
+        self.border_title = f" NODE ACTIONS · lite.sh · build {BUILD} (hover · H) "
+        meta = {a: (label, desc) for a, label, desc in ACTION_BUTTONS}
+        for cat, rows in ACTION_GROUPS:
+            head = Static("", classes="group-head")
+            head.border_title = f" {cat} "
+            yield head
+            for ids in rows:
+                with Horizontal(classes="button-row"):
+                    for action_id in ids:
+                        label, desc = meta[action_id]
+                        btn = Button(label, id=f"act-{action_id}",
+                                     classes="danger" if action_id in ACTION_DANGER else "")
+                        btn.tooltip = desc
+                        yield btn
+                    for _ in range(4 - len(ids)):
+                        yield Static("", classes="spacer")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id and event.button.id.startswith("act-"):
@@ -756,7 +814,8 @@ class InputDialog(ModalScreen[dict | None]):
     InputDialog #cancel {{ background: {QUBIC_SURFACE}; color: {QUBIC_TEXT}; border: tall {QUBIC_BORDER}; }}
     """
 
-    def __init__(self, title: str, fields: list[tuple[str, str, str, bool]]) -> None:
+    # fields: (key, label, placeholder, password[, default_value])
+    def __init__(self, title: str, fields: list[tuple]) -> None:
         super().__init__()
         self._title = title
         self._fields = fields
@@ -764,9 +823,11 @@ class InputDialog(ModalScreen[dict | None]):
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
             yield Static(self._title, classes="title")
-            for key, label, placeholder, password in self._fields:
+            for field in self._fields:
+                key, label, placeholder, password = field[:4]
+                value = field[4] if len(field) > 4 else ""
                 yield Static(label, classes="field-label")
-                yield Input(placeholder=placeholder, password=password, id=f"in-{key}")
+                yield Input(value=value, placeholder=placeholder, password=password, id=f"in-{key}")
             with Horizontal(classes="buttons"):
                 yield Button("OK", id="ok")
                 yield Button("Cancel", id="cancel")
@@ -776,7 +837,7 @@ class InputDialog(ModalScreen[dict | None]):
             self.query_one(f"#in-{self._fields[0][0]}", Input).focus()
 
     def _collect(self) -> dict[str, str]:
-        return {k: self.query_one(f"#in-{k}", Input).value for k, _, _, _ in self._fields}
+        return {f[0]: self.query_one(f"#in-{f[0]}", Input).value for f in self._fields}
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(self._collect() if event.button.id == "ok" else None)
@@ -956,7 +1017,14 @@ class GuardianApp(App):
         self._snap: dict | None = None
 
     def get_css_variables(self) -> dict[str, str]:
-        return QUBIC_THEME.generate()
+        variables = QUBIC_THEME.generate()
+        # Textual's default focus style is `bold reverse`; `reverse` swaps fg/bg,
+        # which paints a focused/hovered button's label in its own background
+        # colour → text vanishes. Kill it globally: every button sets its own
+        # explicit focus colours (white on teal/red), so reverse buys us nothing
+        # but the bug.
+        variables["button-focus-text-style"] = "none"
+        return variables
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -1286,7 +1354,7 @@ class GuardianApp(App):
                 return
             tag = res.get("tag", "").strip() or "latest"
             self._run_lite(["deploy", "--tag", tag], label=f"deploy {tag}")
-        self.push_screen(InputDialog("Deploy Docker Tag", [("tag", "Image Tag", "latest / E207.2", False)]), _done)
+        self.push_screen(InputDialog("Deploy Docker Tag", [("tag", "Image Tag", "latest / E207.2", False, "latest")]), _done)
 
     @work(group="lite_action")
     async def _run_lite(self, args: list[str], *, stdin_data: str | None = None,
