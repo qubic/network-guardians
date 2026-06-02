@@ -118,7 +118,7 @@ logger = logging.getLogger(__name__)
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-BUILD = "ui9-groups"  # visible build marker (NODE ACTIONS title) to confirm the running version
+BUILD = "ui13-runfield"  # visible build marker (NODE ACTIONS title) to confirm the running version
 DEFAULT_DATA_DIR = "/opt/qubic-lite"
 DEFAULT_API_BASE = "https://guardians.qubic.org/api/v1"
 NETWORK_RPC = "https://rpc.qubic.org/v1/tick-info"
@@ -678,6 +678,12 @@ ACTION_GROUPS = [
     ("OTHER",   [["deploy", "update"]]),
 ]
 
+# Number every action in display order (top→bottom, left→right) so each button's
+# badge matches the "Run #" field — mirrors the numbered classic `lite.sh -old` menu.
+ACTION_ORDER = [aid for _cat, _rows in ACTION_GROUPS for _row in _rows for aid in _row]
+ACTION_NUM = {aid: i + 1 for i, aid in enumerate(ACTION_ORDER)}
+NUM_ACTION = {i + 1: aid for i, aid in enumerate(ACTION_ORDER)}
+
 
 class ActionsPanel(Static):
     DEFAULT_CSS = f"""
@@ -688,6 +694,19 @@ class ActionsPanel(Static):
         border-title-color: {QUBIC_MINT}; border-title-style: bold; border-title-align: left;
     }}
     ActionsPanel .spacer {{ width: 1fr; height: 1; margin: 0 1 0 0; }}
+    ActionsPanel .run-label {{
+        width: 1fr; height: 1; margin: 0 1 0 0; color: {QUBIC_DIM};
+        text-align: right; content-align-vertical: middle;
+    }}
+    ActionsPanel Input {{
+        width: 1fr; height: 1; min-height: 1; margin: 0; padding: 0 1; border: none;
+        background: {QUBIC_DARKER}; color: {QUBIC_TEXT};
+    }}
+    ActionsPanel Input:focus {{ border: none; background: {QUBIC_SURFACE}; color: #ffffff; }}
+    /* never let the default red `-invalid` / `-valid` border (tall $error) creep in —
+       it adds a row to the height:1 field and leaves a red ring after blur */
+    ActionsPanel Input.-invalid, ActionsPanel Input.-invalid:focus,
+    ActionsPanel Input.-valid, ActionsPanel Input.-valid:focus {{ border: none; }}
     ActionsPanel Button {{
         margin: 0 1 0 0; width: 1fr; height: 1; min-width: 0; border: none;
         background: {QUBIC_SURFACE}; color: {QUBIC_TEXT}; text-style: none;
@@ -713,20 +732,46 @@ class ActionsPanel(Static):
             head = Static("", classes="group-head")
             head.border_title = f" {cat} "
             yield head
-            for ids in rows:
+            for row_idx, ids in enumerate(rows):
                 with Horizontal(classes="button-row"):
                     for action_id in ids:
                         label, desc = meta[action_id]
-                        btn = Button(label, id=f"act-{action_id}",
+                        btn = Button(f"{ACTION_NUM[action_id]} {label}", id=f"act-{action_id}",
                                      classes="danger" if action_id in ACTION_DANGER else "")
                         btn.tooltip = desc
                         yield btn
-                    for _ in range(4 - len(ids)):
-                        yield Static("", classes="spacer")
+                    # spare columns: on INSTALL's first row hold the run-by-number
+                    # field; everywhere else just pad so the grid stays aligned.
+                    if cat == "INSTALL" and row_idx == 0:
+                        yield Static("Run [1-12]:", classes="run-label")
+                        yield Input(placeholder="#", id="act-num", max_length=2, restrict=r"[0-9]*",
+                                    tooltip="Type an action number, Enter to run · Esc to leave the field")
+                    else:
+                        for _ in range(4 - len(ids)):
+                            yield Static("", classes="spacer")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id and event.button.id.startswith("act-"):
             self.post_message(self.Action(event.button.id[4:]))
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id != "act-num":
+            return
+        raw = event.value.strip()
+        event.input.value = ""
+        # release focus so the single-key shortcuts (L, C, R, G, H, Q) work again —
+        # a focused Input swallows every letter key, which looked like "L is broken".
+        self.app.set_focus(None)
+        action_id = NUM_ACTION.get(int(raw)) if raw.isdigit() else None
+        if action_id:
+            self.post_message(self.Action(action_id))
+
+    def on_key(self, event) -> None:
+        # Esc inside the run field = clear it and hand focus back to the shortcuts.
+        if event.key == "escape" and getattr(self.app.focused, "id", None) == "act-num":
+            self.query_one("#act-num", Input).value = ""
+            self.app.set_focus(None)
+            event.stop()
 
 
 class LogPanel(Static):
@@ -875,14 +920,20 @@ class HelpScreen(ModalScreen[None]):
         ]
         for key, desc in [
             ("G", "Refresh Guardian score now"), ("R", "Log filter: full (default) ↔ events-only"),
-            ("C", "Clear the log"), ("L", "Show/hide the log"), ("H", "This help"), ("Q", "Quit"),
+            ("C", "Clear the log"), ("L", "Copy log: frozen full-screen, drag to select (no Shift)"),
+            ("H", "This help"), ("Q", "Quit"),
         ]:
             lines.append(f"  [bold {QUBIC_TEAL}]{key:<4}[/] [{QUBIC_TEXT}]{desc}[/]")
-        lines += ["", f"[bold {QUBIC_CYAN}]NODE ACTIONS[/] [{QUBIC_DIM}](lite.sh)[/]"]
-        for action_id, label, desc in ACTION_BUTTONS:
+        lines += ["", f"[bold {QUBIC_CYAN}]NODE ACTIONS[/] [{QUBIC_DIM}](lite.sh)[/]",
+                  f"  [{QUBIC_DIM}]Click a button, or just press its number (1-12) — it jumps[/]\n"
+                  f"  [{QUBIC_DIM}]into the[/] [bold {QUBIC_TEAL}]Run[/] [{QUBIC_DIM}]field; press Enter to run, Esc to leave it.[/]"]
+        for action_id, label, desc in sorted(ACTION_BUTTONS, key=lambda b: ACTION_NUM.get(b[0], 99)):
+            if action_id not in ACTION_NUM:
+                continue
             danger = f"  [{QUBIC_RED}](destructive)[/]" if action_id in ACTION_DANGER else ""
             clean = label.split(" ", 1)[-1]
-            lines.append(f"  [bold {QUBIC_CREAM}]{clean:<13}[/] [{QUBIC_TEXT}]{desc}[/]{danger}")
+            lines.append(f"  [bold {QUBIC_TEAL}]{ACTION_NUM[action_id]:>2}[/] "
+                         f"[bold {QUBIC_CREAM}]{clean:<13}[/] [{QUBIC_TEXT}]{desc}[/]{danger}")
         return "\n".join(lines)
 
     def action_dismiss(self) -> None:
@@ -962,6 +1013,85 @@ class LogScreen(ModalScreen[None]):
         self._streamer.stop()
 
 
+class LogCopyScreen(ModalScreen[None]):
+    """Frozen, selectable full-log snapshot for copying. While it is open the
+    terminal's mouse tracking is turned OFF, so a plain mouse drag does native text
+    selection — no Shift needed. The snapshot is frozen (not live) on purpose: live
+    redraws would wipe the terminal selection mid-drag."""
+
+    BINDINGS = [
+        Binding("escape", "dismiss", "Close"), Binding("q", "dismiss", "Close"),
+        Binding("l", "dismiss", "Close"),
+    ]
+    DEFAULT_CSS = f"""
+    LogCopyScreen {{ align: center middle; background: $background 60%; }}
+    LogCopyScreen #copybox {{
+        width: 96%; height: 92%; padding: 0 1; background: {QUBIC_DARKER};
+        border: round {QUBIC_MINT}; border-title-color: {QUBIC_MINT};
+        border-title-style: bold; border-title-align: left;
+        border-subtitle-color: {QUBIC_DIM}; border-subtitle-align: right;
+    }}
+    LogCopyScreen RichLog {{ height: 1fr; scrollbar-size: 1 1; background: {QUBIC_DARKER}; scrollbar-color: {QUBIC_TEAL}; }}
+    """
+
+    def __init__(self, container: str, events_only: bool) -> None:
+        super().__init__()
+        self._container = container
+        self._events_only = events_only
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="copybox"):
+            yield RichLog(highlight=False, markup=True, max_lines=4000, wrap=True,
+                          auto_scroll=False, id="copy-log")
+
+    def on_mount(self) -> None:
+        box = self.query_one("#copybox", Vertical)
+        box.border_title = " COPY LOG · frozen snapshot "
+        box.border_subtitle = " drag to select (no Shift) · ↑↓/PgUp/PgDn scroll · Esc close "
+        self._set_mouse(enabled=False)
+        self._load()
+
+    def _set_mouse(self, *, enabled: bool) -> None:
+        drv = getattr(self.app, "_driver", None)
+        try:
+            if enabled and hasattr(drv, "_enable_mouse_support"):
+                drv._enable_mouse_support()
+            elif not enabled and hasattr(drv, "_disable_mouse_support"):
+                drv._disable_mouse_support()
+        except Exception:
+            pass
+
+    @work(exclusive=True, group="copylog")
+    async def _load(self) -> None:
+        rl = self.query_one("#copy-log", RichLog)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "docker", "logs", "--tail", "600", self._container,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+            out, _ = await proc.communicate()
+        except Exception as e:
+            rl.write(f"[{QUBIC_CORAL}]could not read logs: {markup_escape(str(e))}[/]")
+            return
+        for raw in out.decode("utf-8", "replace").splitlines():
+            entry = parse_log(raw)
+            if entry is None or not entry.text:
+                continue
+            if self._events_only and entry.noise:
+                continue
+            safe = markup_escape(entry.text)
+            color = LEVEL_COLORS.get(entry.level, "")
+            rl.write(f"[{QUBIC_DIM}]{entry.ts}[/] [{color}]{safe}[/]" if entry.ts else f"[{color}]{safe}[/]")
+        rl.scroll_end(animate=False)
+        rl.focus()
+
+    def action_dismiss(self) -> None:
+        self._set_mouse(enabled=True)
+        self.dismiss(None)
+
+    async def on_unmount(self) -> None:
+        self._set_mouse(enabled=True)
+
+
 # ─── App ─────────────────────────────────────────────────────────────────────────
 
 
@@ -989,7 +1119,7 @@ class GuardianApp(App):
         Binding("g", "refresh_guardian", "Guardian", key_display="G"),
         Binding("r", "toggle_filter", "Filter", key_display="R"),
         Binding("c", "clear_logs", "Clear", key_display="C"),
-        Binding("l", "toggle_log", "Log", key_display="L"),
+        Binding("l", "copy_log", "Copy log", key_display="L"),
         Binding("h", "help", "Help", key_display="H"),
     ]
 
@@ -1264,9 +1394,24 @@ class GuardianApp(App):
     def action_clear_logs(self) -> None:
         self.query_one(LogPanel).clear()
 
-    def action_toggle_log(self) -> None:
-        lp = self.query_one(LogPanel)
-        lp.display = not lp.display
+    def action_copy_log(self) -> None:
+        # Full-screen frozen log you can select WITHOUT holding Shift (mouse tracking
+        # is disabled while it is open). The live inline log stays put underneath.
+        self.push_screen(LogCopyScreen(self._container_name, self._events_only))
+
+    def on_key(self, event) -> None:
+        # Pressing a digit on the main screen jumps straight into the Run field, so you
+        # can type a number + Enter without clicking the field first. Skipped while a
+        # dialog/modal is open (digits there belong to that screen).
+        if (len(self.screen_stack) == 1 and event.character and event.character.isdigit()
+                and getattr(self.focused, "id", None) != "act-num"):
+            try:
+                inp = self.query_one("#act-num", Input)
+            except Exception:
+                return
+            inp.focus()
+            inp.value = (inp.value + event.character)[-2:]
+            event.stop()
 
     def action_toggle_filter(self) -> None:
         self._events_only = not self._events_only
