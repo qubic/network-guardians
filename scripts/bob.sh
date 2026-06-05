@@ -740,8 +740,19 @@ do_update() {
         log_ok "bob.sh already up to date"
     else
         chmod +x "$tmp_file"
-        mv "$tmp_file" "$SCRIPT_PATH"
-        log_ok "bob.sh updated"
+        # Only claim success if the replace truly happened. The old code printed
+        # "updated" unconditionally, so a failed mv (read-only fs, no perms,
+        # wrong path) left users re-running the OLD file in a loop, fooled into
+        # thinking it worked. Report the real result and how to recover.
+        if mv -f "$tmp_file" "$SCRIPT_PATH" 2>/dev/null; then
+            log_ok "bob.sh updated"
+        else
+            rm -f "$tmp_file"
+            log_error "Update could NOT replace this script (permissions / read-only fs?)."
+            log_warn  "Recover manually, then restart:"
+            log_warn  "  sudo curl -fsSL '$BOB_SH_URL' -o '$SCRIPT_PATH' && sudo chmod +x '$SCRIPT_PATH'"
+            return 1
+        fi
     fi
 
     # Install/refresh the Guardian dashboard: fetch bob-guardian.py from git,
