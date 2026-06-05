@@ -38,6 +38,10 @@ API_PORT=40420
 # Public RPC
 NETWORK_RPC="https://rpc.qubic.org/v1/tick-info"
 
+# Self-update / Guardian dashboard
+BOB_SH_URL="https://raw.githubusercontent.com/qubic/network-guardians/main/scripts/bob.sh"
+GUARDIAN_PY_URL="https://raw.githubusercontent.com/qubic/network-guardians/main/scripts/bob-guardian.py"
+
 # --- Colors ---
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -60,7 +64,11 @@ print_usage() {
     echo "  Interactive:  $0"
     echo "  CLI:          $0 <command> [options]"
     echo ""
+    echo "Default (no command): opens the Guardian dashboard once a node is installed."
+    echo ""
     echo "Commands:"
+    echo "  dashboard     Open the Guardian dashboard (bob-guardian.py)"
+    echo "  old           Open the classic text menu (fallback)"
     echo "  install       Install and start Bob node"
     echo "  uninstall     Remove Bob node and data"
     echo "  status        Show container status"
@@ -123,9 +131,40 @@ get_network_tick() {
     [ -n "$resp" ] && echo "$resp" | grep -oP '"tick":\K[0-9]+' | head -1
 }
 
+# Resolve the first reachable Bob API base into $BOB_API_BASE (cached).
+# The published port can be unreachable via localhost on hardened nodes where the
+# firewall blocks host->bridge forwarding (route_localnet off): the loopback DNAT
+# stalls and only the host's primary IP — which hits docker-proxy on 0.0.0.0 —
+# answers. Try 127.0.0.1 -> primary host IP -> localhost, keep the first that works.
+# Call this from PARENT context (not inside $()), so the cache survives.
+BOB_API_BASE=""
+host_primary_ip() {
+    ip route get 8.8.8.8 2>/dev/null | grep -oP 'src \K[0-9.]+' | head -1
+}
+resolve_bob_api() {
+    # fast path: cached base still answering
+    if [ -n "$BOB_API_BASE" ] && \
+       curl -sf --max-time 3 -o /dev/null "${BOB_API_BASE}/status" 2>/dev/null; then
+        return 0
+    fi
+    BOB_API_BASE=""
+    local hip host
+    hip=$(host_primary_ip)
+    for host in 127.0.0.1 "$hip" localhost; do
+        [ -z "$host" ] && continue
+        if curl -sf --max-time 3 -o /dev/null "http://${host}:${API_PORT}/status" 2>/dev/null; then
+            BOB_API_BASE="http://${host}:${API_PORT}"
+            return 0
+        fi
+    done
+    return 1
+}
+
 get_local_tick() {
+    [ -z "$BOB_API_BASE" ] && resolve_bob_api
+    [ -z "$BOB_API_BASE" ] && return
     local resp
-    resp=$(curl -sf --max-time 5 "http://localhost:${API_PORT}/status" 2>/dev/null || true)
+    resp=$(curl -sf --max-time 5 "${BOB_API_BASE}/status" 2>/dev/null || true)
     [ -n "$resp" ] && echo "$resp" | grep -oP '"currentFetchingTick":\K[0-9]+'
 }
 
@@ -323,6 +362,9 @@ do_status() {
             docker ps --filter "name=${CONTAINER_NAME}" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
             docker ps --filter "name=watchtower-bob" --format "table {{.Names}}\t{{.Status}}" 2>/dev/null || true
 
+            # resolve in parent context so the cached base survives across polls
+            resolve_bob_api || true
+
             local tick_now
             tick_now=$(get_local_tick)
 
@@ -404,8 +446,9 @@ do_info() {
     fi
 
     log_info "Fetching node info..."
-    local response
-    response=$(curl -sf --max-time 10 "http://localhost:${API_PORT}/status" 2>/dev/null || true)
+    resolve_bob_api || true
+    local response=""
+    [ -n "$BOB_API_BASE" ] && response=$(curl -sf --max-time 10 "${BOB_API_BASE}/status" 2>/dev/null || true)
 
     if [ -z "$response" ]; then
         log_error "Could not fetch status from port ${API_PORT}"
@@ -673,13 +716,12 @@ do_migrate() {
 }
 
 do_update() {
-    local update_url tmp_file
-    update_url="https://raw.githubusercontent.com/qubic/network-guardians/main/scripts/bob.sh"
+    local tmp_file
     tmp_file=$(mktemp)
 
     log_info "Checking for updates..."
 
-    if ! curl -sfL --max-time 15 -o "$tmp_file" "$update_url"; then
+    if ! curl -sfL --max-time 15 -o "$tmp_file" "$BOB_SH_URL"; then
         rm -f "$tmp_file"
         log_error "Failed to download update"
         return 1
@@ -692,18 +734,102 @@ do_update() {
         return 1
     fi
 
-    # Check if there are changes
+    # Apply bob.sh update (if changed)
     if cmp -s "$SCRIPT_PATH" "$tmp_file"; then
         rm -f "$tmp_file"
-        log_ok "Already up to date"
-        return 0
+        log_ok "bob.sh already up to date"
+    else
+        chmod +x "$tmp_file"
+        mv "$tmp_file" "$SCRIPT_PATH"
+        log_ok "bob.sh updated"
     fi
 
-    # Apply update
-    chmod +x "$tmp_file"
-    mv "$tmp_file" "$SCRIPT_PATH"
-    log_ok "Updated successfully!"
+    # Install/refresh the Guardian dashboard: fetch bob-guardian.py from git,
+    # chmod +x, and set up the python venv + deps — everything it needs.
+    install_guardian || true
+
     log_info "Restart the script to use the new version"
+}
+
+# --- Guardian dashboard (bob-guardian.py) ---
+
+guardian_paths() {
+    SCRIPT_HOME=$(dirname "$SCRIPT_PATH")
+    GUARDIAN_PY="${SCRIPT_HOME}/bob-guardian.py"
+    GUARDIAN_VENV="${SCRIPT_HOME}/.venv"
+}
+
+# Download bob-guardian.py from git + chmod +x. Returns 1 on failure.
+download_guardian_py() {
+    guardian_paths
+    local tmp
+    tmp=$(mktemp)
+    if curl -sfL --max-time 20 -o "$tmp" "$GUARDIAN_PY_URL" && head -1 "$tmp" | grep -q 'python'; then
+        if cmp -s "$GUARDIAN_PY" "$tmp" 2>/dev/null; then
+            rm -f "$tmp"
+            log_ok "Dashboard already up to date"
+        else
+            mv "$tmp" "$GUARDIAN_PY"
+            chmod u+x "$GUARDIAN_PY" 2>/dev/null || true
+            log_ok "Dashboard installed (bob-guardian.py)"
+        fi
+        return 0
+    fi
+    rm -f "$tmp"
+    log_warn "Could not fetch dashboard (bob-guardian.py) from git"
+    return 1
+}
+
+# Create/refresh the python venv with the dashboard deps. Returns 1 on failure.
+ensure_venv() {
+    guardian_paths
+    if ! command -v python3 >/dev/null 2>&1; then
+        log_warn "python3 not found (needed for the dashboard)"
+        return 1
+    fi
+    if [ -x "${GUARDIAN_VENV}/bin/python" ] && "${GUARDIAN_VENV}/bin/python" -c 'import textual' 2>/dev/null; then
+        return 0
+    fi
+    log_info "Setting up dashboard environment (~30s)..."
+    if ! python3 -m venv "$GUARDIAN_VENV" 2>/dev/null; then
+        if command -v apt-get >/dev/null 2>&1; then
+            apt-get update -y >/dev/null 2>&1 || true
+            apt-get install -y python3-venv >/dev/null 2>&1 || true
+        fi
+        python3 -m venv "$GUARDIAN_VENV" || { log_warn "venv creation failed"; return 1; }
+    fi
+    "${GUARDIAN_VENV}/bin/pip" install --quiet --upgrade pip >/dev/null 2>&1 || true
+    if ! "${GUARDIAN_VENV}/bin/pip" install --quiet 'textual>=0.80,<1' rich; then
+        log_warn "Failed to install dashboard dependencies"
+        return 1
+    fi
+    return 0
+}
+
+# Full install used by 'update': dashboard + deps + chmod.
+install_guardian() {
+    download_guardian_py || return 1
+    ensure_venv || return 1
+    log_ok "Dashboard ready — next './bob.sh' opens it"
+}
+
+launch_guardian() {
+    guardian_paths
+    # Not installed yet -> classic menu. 'update' installs it.
+    if [ ! -f "$GUARDIAN_PY" ]; then
+        log_info "New dashboard not installed yet — opening the classic menu."
+        log_info "Run 'update' to install the dashboard, then restart."
+        interactive_menu
+        return
+    fi
+    if ! ensure_venv; then
+        log_warn "Dashboard dependencies missing — opening the classic menu."
+        log_info "Run 'update' to (re)install, then restart."
+        interactive_menu
+        return
+    fi
+    exec "${GUARDIAN_VENV}/bin/python" "$GUARDIAN_PY" \
+        --bob-script "$SCRIPT_PATH" --api-port "$API_PORT"
 }
 
 interactive_install() {
@@ -808,12 +934,24 @@ interactive_menu() {
 
 # --- Main ---
 
+# When sourced (e.g. for the dashboard) only load the functions/config
+# above; skip the CLI/menu below.
+if [ "${BASH_SOURCE[0]}" != "${0}" ]; then
+    return 0 2>/dev/null || true
+fi
+
 NODE_SEED=""
 NODE_ALIAS=""
 
 # Parse arguments
 if [ $# -eq 0 ]; then
-    interactive_menu
+    # Installed node  -> Guardian dashboard
+    # Fresh machine    -> classic install menu (familiar first-run flow)
+    if container_exists || [ -f "${DATA_DIR}/docker-compose.yml" ]; then
+        launch_guardian
+    else
+        interactive_menu
+    fi
     exit 0
 fi
 
@@ -845,6 +983,8 @@ case "$COMMAND" in
     reset)        do_reset ;;
     migrate)      do_migrate ;;
     update)       do_update ;;
+    dashboard|guardian|ui) launch_guardian ;;
+    old|-old|--old|menu)   interactive_menu ;;
     help|--help|-h) print_usage ;;
     *)          log_error "Unknown command: $COMMAND"; print_usage; exit 1 ;;
 esac
