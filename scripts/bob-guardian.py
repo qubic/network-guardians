@@ -377,8 +377,11 @@ RE_BOB_STATE = re.compile(r"FetchingTick:\s*(\d+).*?FetchingLog:\s*(\d+).*?Index
 RE_BOB_NET = re.compile(r"Local Tick:\s*(\d+)\s*\|\s*Network tick:\s*(\d+)\s*\|\s*Network epoch:\s*(\d+)")
 # "Peer 5.9.98.143:21842 => Last Activity: 8 seconds ago"
 RE_BOB_PEER = re.compile(r"Peer\s+([\d.]+:\d+)\s*=>\s*Last Activity:\s*(\d+)\s*seconds")
-# "KeyDB memory: 782.77 MB / 8.00 GB (9.6%)"
-RE_BOB_MEM = re.compile(r"KeyDB memory:\s*([\d.]+\s*\w+)\s*/\s*([\d.]+\s*\w+)\s*\(([\d.]+)%\)")
+# "KeyDB memory: 782.77 MB / 8.00 GB (9.6%)" — and under load the node switches to
+# "KeyDB memory pressure: 1.97 GB / 2.00 GB (98.6%) — cleaner may be falling behind…",
+# so accept the optional " pressure" word (else the panel freezes on the last normal
+# reading exactly when usage is high and the M-hint should show).
+RE_BOB_MEM = re.compile(r"KeyDB memory(?: pressure)?:\s*([\d.]+\s*\w+)\s*/\s*([\d.]+\s*\w+)\s*\(([\d.]+)%\)")
 # per-tick / periodic spam — hidden unless raw-log mode is on. The "events-only"
 # view keeps the meaningful ones (Network tick, Replaced peer, Saving/Saved
 # checkpoints, check-in, TickStream, warnings/errors) and drops the high-rate churn.
