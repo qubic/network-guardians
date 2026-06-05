@@ -491,6 +491,10 @@ class _RowPanel(Static):
         self.query_one(f"#{row_id}", Static).update(markup)
 
 
+# KeyDB maxmemory: surface the "raise the limit" action only when near full.
+SET_MEM_THRESHOLD = 90  # percent
+
+
 class NodePanel(_RowPanel):
     TITLE = "NODE"
     ROWS = [
@@ -505,8 +509,9 @@ class NodePanel(_RowPanel):
 
     def update_mem(self, used: str, total: str, pct: float) -> None:
         col = QUBIC_CORAL if pct >= 85 else QUBIC_TEXT
+        hint = f"  [{QUBIC_CORAL}]⚠ press M to raise[/]" if pct >= SET_MEM_THRESHOLD else ""
         self.set_row("nd-memory", "KeyDB Mem",
-                     f"[{col}]{used}[/][{QUBIC_DIM}] / {total} ({pct:.0f}%)[/]")
+                     f"[{col}]{used}[/][{QUBIC_DIM}] / {total} ({pct:.0f}%)[/]{hint}")
 
     def update_local(self, container_state: str, status: dict | None, health: str) -> None:
         self.set_line("nd-container", f"[{QUBIC_LABEL}]{'Container':<{self.LABEL_W}}[/] {container_state}")
@@ -611,6 +616,7 @@ class GuardianPanel(Static):
                 yield Static("", id="gd-p2p", classes="row")
             with Vertical(classes="gd-col"):
                 yield Static(f"[{QUBIC_CYAN}]REWARD[/]", classes="gd-head")
+                yield Static("", id="gd-region", classes="row")
                 yield Static("", id="gd-points", classes="row")
                 yield Static("", id="gd-reward", classes="row")
 
@@ -623,7 +629,7 @@ class GuardianPanel(Static):
     def update_score(self, node: dict | None, stats: dict | None) -> None:
         if node is None:
             self._line("gd-eligible", f"[{QUBIC_DIM}]node not yet tracked by Guardians[/]")
-            for rid in ("gd-epoch", "gd-checks", "gd-final", "gd-uptime",
+            for rid in ("gd-epoch", "gd-checks", "gd-region", "gd-final", "gd-uptime",
                         "gd-sync", "gd-p2p", "gd-points", "gd-reward"):
                 self._line(rid, "")
         else:
@@ -653,6 +659,14 @@ class GuardianPanel(Static):
             tc, sc = node.get("totalChecks", 0), node.get("successfulChecks", 0)
             tcol = QUBIC_MINT if tc >= 1500 else QUBIC_CREAM
             self._set("gd-checks", "Checks", f"[{QUBIC_TEXT}]{sc}[/]/[{tcol}]{tc}[/] [{QUBIC_DIM}](≥1500)[/]")
+
+            region = ls.get("region") or node.get("country") or "-"
+            mult = ls.get("regionMultiplier")
+            if mult is None:
+                self._set("gd-region", "Region", f"[{QUBIC_TEXT}]{region}[/]", 7)
+            else:
+                mcol = QUBIC_MINT if mult >= 1.0 else QUBIC_CREAM if mult >= 0.7 else QUBIC_CORAL
+                self._set("gd-region", "Region", f"[{QUBIC_TEXT}]{region}[/] [{mcol}]×{mult:g}[/][{QUBIC_DIM}] weight[/]", 7)
             self._set("gd-points", "Points", f"[{QUBIC_TEXT}]{_fmt_tick(int(ls.get('rewardPoints', 0)))}[/]", 7)
             est = ls.get("estimatedReward")
             self._set("gd-reward", "Est.", f"[bold {QUBIC_CREAM}]{_fmt_tick(est)}[/] [{QUBIC_DIM}]QU[/]" if est else "-", 7)
@@ -1150,6 +1164,7 @@ class BobGuardianApp(App):
         Binding("c", "clear_logs", "Clear", key_display="C"),
         Binding("l", "copy_log", "Copy log", key_display="L"),
         Binding("h", "help", "Help", key_display="H"),
+        Binding("m", "set_mem", "Set mem", key_display="M"),
     ]
 
     def __init__(self, container_name: str, api_port: int, bob_script: str | None,
@@ -1330,16 +1345,22 @@ class BobGuardianApp(App):
         self._behind_hist = self._behind_hist[-60:]
         if len(self._behind_hist) < 4:
             return "warming up…"
-        t0, b0 = self._behind_hist[0]
-        elapsed = now - t0
-        closed = b0 - behind
-        if elapsed > 0 and closed > 0:
-            eta = int(behind * elapsed / closed)
-            rate = closed * 60 / elapsed
-            return f"{_fmt_eta(eta)}  ({rate:.0f} t/min)"
-        if closed <= 0:
-            return "∞ not catching up"
-        return "warming up…"
+        # Least-squares slope of "behind" over the whole ~3 min window, not just
+        # oldest-vs-now: the network reference tick jitters sample to sample, so a
+        # single endpoint diff would flip to "not catching up" even while the node
+        # was steadily closing the gap. The trend over many samples is stable.
+        n = len(self._behind_hist)
+        t_mean = sum(t for t, _ in self._behind_hist) / n
+        b_mean = sum(b for _, b in self._behind_hist) / n
+        var = sum((t - t_mean) ** 2 for t, _ in self._behind_hist)
+        if var <= 0:
+            return "warming up…"
+        slope = sum((t - t_mean) * (b - b_mean) for t, b in self._behind_hist) / var
+        closing = -slope  # ticks/sec the gap is shrinking; >0 means catching up
+        if closing > 0:
+            eta = int(behind / closing)
+            return f"{_fmt_eta(eta)}  ({closing * 60:.0f} t/min)"
+        return "∞ not catching up"
 
     @work(exclusive=True, group="guardian")
     async def poll_guardian(self) -> None:
@@ -1450,6 +1471,27 @@ class BobGuardianApp(App):
 
     def action_help(self) -> None:
         self.push_screen(HelpScreen())
+
+    def action_set_mem(self) -> None:
+        # Only offered near full — raising KeyDB maxmemory otherwise is pointless.
+        if len(self.screen_stack) > 1:
+            return
+        pct = self._mem[2] if self._mem else 0.0
+        if pct < SET_MEM_THRESHOLD:
+            self.query_one(LogPanel).write_note(
+                f"[{QUBIC_CREAM}]» ",
+                f"KeyDB at {pct:.0f}% — raising maxmemory only matters near full (≥{SET_MEM_THRESHOLD}%)")
+            return
+        cur_total = self._mem[1] if self._mem else "?"
+
+        def _done(res: dict | None) -> None:
+            if not res:
+                return
+            val = (res.get("mem") or "").strip()
+            if val:
+                self._run_bob(["set-mem", val], label=f"set KeyDB maxmemory = {val}")
+        self.push_screen(InputDialog("Set KeyDB maxmemory", [
+            ("mem", f"New limit (current total {cur_total})", "e.g. 12gb", False)]), _done)
 
     # ─── bob.sh actions ───────────────────────────────────────────────────────
     def _bob_path(self) -> str | None:

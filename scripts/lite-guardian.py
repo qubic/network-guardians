@@ -584,6 +584,7 @@ class GuardianPanel(Static):
                 yield Static("", id="gd-p2p", classes="row")
             with Vertical(classes="gd-col"):
                 yield Static(f"[{QUBIC_CYAN}]REWARD[/]", classes="gd-head")
+                yield Static("", id="gd-region", classes="row")
                 yield Static("", id="gd-points", classes="row")
                 yield Static("", id="gd-reward", classes="row")
 
@@ -596,7 +597,7 @@ class GuardianPanel(Static):
     def update_score(self, node: dict | None, stats: dict | None) -> None:
         if node is None:
             self._line("gd-eligible", f"[{QUBIC_DIM}]node not yet tracked by Guardians[/]")
-            for rid in ("gd-epoch", "gd-checks", "gd-final", "gd-uptime",
+            for rid in ("gd-epoch", "gd-checks", "gd-region", "gd-final", "gd-uptime",
                         "gd-sync", "gd-p2p", "gd-points", "gd-reward"):
                 self._line(rid, "")
         else:
@@ -626,6 +627,14 @@ class GuardianPanel(Static):
             tc, sc = node.get("totalChecks", 0), node.get("successfulChecks", 0)
             tcol = QUBIC_MINT if tc >= 1500 else QUBIC_CREAM
             self._set("gd-checks", "Checks", f"[{QUBIC_TEXT}]{sc}[/]/[{tcol}]{tc}[/] [{QUBIC_DIM}](≥1500)[/]")
+
+            region = ls.get("region") or node.get("country") or "-"
+            mult = ls.get("regionMultiplier")
+            if mult is None:
+                self._set("gd-region", "Region", f"[{QUBIC_TEXT}]{region}[/]", 7)
+            else:
+                mcol = QUBIC_MINT if mult >= 1.0 else QUBIC_CREAM if mult >= 0.7 else QUBIC_CORAL
+                self._set("gd-region", "Region", f"[{QUBIC_TEXT}]{region}[/] [{mcol}]×{mult:g}[/][{QUBIC_DIM}] weight[/]", 7)
             self._set("gd-points", "Points", f"[{QUBIC_TEXT}]{_fmt_tick(int(ls.get('rewardPoints', 0)))}[/]", 7)
             est = ls.get("estimatedReward")
             self._set("gd-reward", "Est.", f"[bold {QUBIC_CREAM}]{_fmt_tick(est)}[/] [{QUBIC_DIM}]QU[/]" if est else "-", 7)
@@ -1281,16 +1290,22 @@ class GuardianApp(App):
         self._behind_hist = self._behind_hist[-60:]
         if len(self._behind_hist) < 4:
             return "warming up…"
-        t0, b0 = self._behind_hist[0]
-        elapsed = now - t0
-        closed = b0 - behind
-        if elapsed > 0 and closed > 0:
-            eta = int(behind * elapsed / closed)
-            rate = closed * 60 / elapsed
-            return f"{_fmt_eta(eta)}  ({rate:.0f} t/min)"
-        if closed <= 0:
-            return "∞ not catching up"
-        return "warming up…"
+        # Least-squares slope of "behind" over the whole ~3 min window, not just
+        # oldest-vs-now: the network reference tick jitters sample to sample, so a
+        # single endpoint diff would flip to "not catching up" even while the node
+        # was steadily closing the gap. The trend over many samples is stable.
+        n = len(self._behind_hist)
+        t_mean = sum(t for t, _ in self._behind_hist) / n
+        b_mean = sum(b for _, b in self._behind_hist) / n
+        var = sum((t - t_mean) ** 2 for t, _ in self._behind_hist)
+        if var <= 0:
+            return "warming up…"
+        slope = sum((t - t_mean) * (b - b_mean) for t, b in self._behind_hist) / var
+        closing = -slope  # ticks/sec the gap is shrinking; >0 means catching up
+        if closing > 0:
+            eta = int(behind / closing)
+            return f"{_fmt_eta(eta)}  ({closing * 60:.0f} t/min)"
+        return "∞ not catching up"
 
     @work(exclusive=True, group="guardian")
     async def poll_guardian(self) -> None:

@@ -17,6 +17,7 @@
 #   restart       Restart container
 #   reconfigure   Change seed/alias and restart
 #   reset         Wipe node data and restart fresh
+#   set-mem       Set KeyDB maxmemory (e.g. 12gb) — live + persisted
 #   migrate       Migrate from named volumes to bind mounts
 #   update        Update this script to latest version
 #
@@ -79,6 +80,7 @@ print_usage() {
     echo "  restart       Restart container"
     echo "  reconfigure   Change seed/alias and restart"
     echo "  reset         Wipe node data and restart fresh"
+    echo "  set-mem <sz>  Set KeyDB maxmemory (e.g. 12gb) — live + persisted"
     echo "  migrate       Migrate from named volumes to bind mounts"
     echo "  update        Update this script to latest version"
     echo ""
@@ -943,6 +945,42 @@ interactive_menu() {
     done
 }
 
+do_set_mem() {
+    local val="$1"
+    if [ -z "$val" ]; then
+        log_error "Usage: $0 set-mem <size>   (e.g. 8gb, 12gb, 8192mb)"
+        exit 1
+    fi
+    # redis memory value: digits + optional k/m/g (+ optional b), case-insensitive
+    if [[ ! "$val" =~ ^[0-9]+([kKmMgG][bB]?)?$ ]]; then
+        log_error "Invalid memory value: '$val' (use e.g. 8gb, 12gb, 8192mb)"
+        exit 1
+    fi
+    local env_file="${DATA_DIR}/.env"
+    if [ ! -f "$env_file" ]; then
+        log_error "Node not installed (${env_file} missing)"
+        exit 1
+    fi
+    # Persist so the limit survives container recreation / Watchtower updates: the
+    # bob image entrypoint writes REDIS_MAXMEMORY into redis.conf on every start.
+    if grep -q "^REDIS_MAXMEMORY=" "$env_file"; then
+        sed -i "s/^REDIS_MAXMEMORY=.*/REDIS_MAXMEMORY=${val}/" "$env_file"
+    else
+        echo "REDIS_MAXMEMORY=${val}" >> "$env_file"
+    fi
+    log_ok "Persisted REDIS_MAXMEMORY=${val} in ${env_file}"
+    # Apply immediately without a restart (KeyDB CONFIG SET takes effect live).
+    if container_running; then
+        if docker exec "$CONTAINER_NAME" redis-cli CONFIG SET maxmemory "$val" 2>/dev/null | grep -q OK; then
+            log_ok "Applied live: KeyDB maxmemory = ${val} (no restart needed)"
+        else
+            log_warn "Live apply failed — takes effect on next 'restart'"
+        fi
+    else
+        log_info "Container not running — applies on next start"
+    fi
+}
+
 # --- Main ---
 
 # When sourced (e.g. for the dashboard) only load the functions/config
@@ -969,6 +1007,13 @@ fi
 COMMAND="$1"
 shift
 
+# set-mem takes a positional value (new KeyDB maxmemory) before flag parsing
+MEM_VALUE=""
+if [ "$COMMAND" = "set-mem" ]; then
+    MEM_VALUE="$1"
+    [ $# -gt 0 ] && shift
+fi
+
 while [ $# -gt 0 ]; do
     case "$1" in
         --seed)      NODE_SEED="$2"; shift 2 ;;
@@ -992,6 +1037,7 @@ case "$COMMAND" in
     restart)      do_restart ;;
     reconfigure)  do_reconfigure ;;
     reset)        do_reset ;;
+    set-mem)      do_set_mem "$MEM_VALUE" ;;
     migrate)      do_migrate ;;
     update)       do_update ;;
     dashboard|guardian|ui) launch_guardian ;;
