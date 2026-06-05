@@ -326,19 +326,31 @@ class DockerLogStreamer:
 
     async def stream(self) -> AsyncIterator[str]:
         self._running = True
+        backoff = 3
         while self._running:
             try:
                 self._process = await asyncio.create_subprocess_exec(
                     "docker", "logs", "-f", "--tail", str(self._tail), self._container,
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
                 )
+                got_line = False
                 while self._running:
                     line = await self._process.stdout.readline()
                     if not line:
                         break
-                    yield line.decode("utf-8", "replace").rstrip()
+                    text = line.decode("utf-8", "replace").rstrip()
+                    # Don't surface docker CLI errors as log content. After an
+                    # uninstall the container is gone and `docker logs` keeps
+                    # printing "No such container" — that would spam the panel.
+                    if RE_DOCKER_ERR.search(text):
+                        continue
+                    got_line = True
+                    yield text
                 if self._running:
-                    await asyncio.sleep(3)
+                    # No real lines = container absent (removed / not yet
+                    # created); back off so we stop hammering docker every 3s.
+                    backoff = 3 if got_line else min(backoff * 2, 30)
+                    await asyncio.sleep(backoff)
                     self._tail = 10
             except asyncio.CancelledError:
                 self._running = False
@@ -371,6 +383,9 @@ RE_BOB_MEM = re.compile(r"KeyDB memory:\s*([\d.]+\s*\w+)\s*/\s*([\d.]+\s*\w+)\s*
 # view keeps the meaningful ones (Network tick, Replaced peer, Saving/Saved
 # checkpoints, check-in, TickStream, warnings/errors) and drops the high-rate churn.
 RE_BOB_NOISE = re.compile(r"Current state:|KeyDB memory:|Last Activity:|\[PEER INFO\]|\[-+\]|WS connection (opened|closed)")
+# docker CLI / daemon errors (merged from stderr) — never real bob log content.
+# Seen after uninstall: "Error response from daemon: No such container: qubic-bob".
+RE_DOCKER_ERR = re.compile(r"Error response from daemon:|Error: No such container|Cannot connect to the Docker daemon")
 
 _LEVEL_MAP = {
     "info": "INFO", "warn": "WARNING", "warning": "WARNING", "error": "ERROR",
@@ -428,6 +443,8 @@ def parse_log(line: str) -> LogLine | None:
     """Parse one Bob docker log line into a classified LogLine."""
     line = line.strip()
     if not line:
+        return None
+    if RE_DOCKER_ERR.search(line):
         return None
     m = RE_BOB_LINE.match(line)
     if not m:
