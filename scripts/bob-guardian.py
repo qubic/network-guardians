@@ -812,7 +812,8 @@ class LogPanel(Static):
         log = self.query_one("#log-output", RichLog)
         safe = markup_escape(message)
         color = LEVEL_COLORS.get(level, "")
-        log.write(f"[{QUBIC_DIM}]{ts}[/] [{color}]{safe}[/]" if ts else f"[{color}]{safe}[/]")
+        body = f"[{color}]{safe}[/]" if color else safe
+        log.write(f"[{QUBIC_DIM}]{ts}[/] {body}" if ts else body)
 
     def write_note(self, prefix_markup: str, text: str) -> None:
         self.query_one("#log-output", RichLog).write(f"{prefix_markup}{markup_escape(text)}")
@@ -1003,7 +1004,8 @@ class LogScreen(ModalScreen[None]):
                     continue
                 safe = markup_escape(entry.text)
                 color = LEVEL_COLORS.get(entry.level, "")
-                rl.write(f"[{QUBIC_DIM}]{entry.ts}[/] [{color}]{safe}[/]" if entry.ts else f"[{color}]{safe}[/]")
+                body = f"[{color}]{safe}[/]" if color else safe
+                rl.write(f"[{QUBIC_DIM}]{entry.ts}[/] {body}" if entry.ts else body)
         except asyncio.CancelledError:
             pass
 
@@ -1089,7 +1091,8 @@ class LogCopyScreen(ModalScreen[None]):
                 continue
             safe = markup_escape(entry.text)
             color = LEVEL_COLORS.get(entry.level, "")
-            rl.write(f"[{QUBIC_DIM}]{entry.ts}[/] [{color}]{safe}[/]" if entry.ts else f"[{color}]{safe}[/]")
+            body = f"[{color}]{safe}[/]" if color else safe
+            rl.write(f"[{QUBIC_DIM}]{entry.ts}[/] {body}" if entry.ts else body)
         rl.scroll_end(animate=False)
         rl.focus()
 
