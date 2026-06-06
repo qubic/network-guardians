@@ -565,7 +565,8 @@ class SyncPanel(_RowPanel):
                      f"[{QUBIC_DIM}]Log[/] {lag(log_t)} [{QUBIC_DIM}]· Idx[/] {lag(idx_t)} [{QUBIC_DIM}]· Vfy[/] {lag(vfy_t)}")
 
     def update_sync(self, node_tick: int | None, ref_tick: int | None,
-                    epoch: int | None, eta_text: str | None) -> None:
+                    epoch: int | None, eta_text: str | None,
+                    initial_tick: int | None = None) -> None:
         self.set_row("sy-epoch", "Epoch", f"[{QUBIC_TEXT}]{epoch or '-'}[/]")
         self.set_row("sy-node", "Node Tick", f"[bold {QUBIC_CYAN}]{_fmt_tick(node_tick)}[/]")
         self.set_row("sy-ref", "Net Tick", f"[{QUBIC_TEXT}]{_fmt_tick(ref_tick)}[/]")
@@ -594,7 +595,15 @@ class SyncPanel(_RowPanel):
             self.set_row("sy-state", "State", f"[{QUBIC_CREAM}]● SYNCING[/]")
             self.set_row("sy-behind", "Behind", f"[{QUBIC_CORAL}]{_fmt_tick(behind)}[/] ticks")
             self.set_row("sy-eta", "ETA", f"[{QUBIC_CYAN}]{eta_text or 'warming up…'}[/]")
-            pct = 100.0 * node_tick / ref_tick if ref_tick else 0
+            # Progress is "ticks done of ticks this epoch needs", measured from the
+            # epoch floor (initial_tick) — not from absolute tick 0. With the floor
+            # the bar reads true (e.g. 0.4% just-started); without it both ticks are
+            # ~56M and the ratio is always ~99% even on a fresh node.
+            if initial_tick and ref_tick > initial_tick:
+                span = ref_tick - initial_tick
+                pct = max(0.0, min(100.0, 100.0 * (node_tick - initial_tick) / span))
+            else:
+                pct = 100.0 * node_tick / ref_tick if ref_tick else 0
             self.set_line("sy-bar", f"[{QUBIC_LABEL}]{'Sync':<{self.LABEL_W}}[/] {_bar(pct, 30, QUBIC_CYAN)} {pct:.2f}%")
 
 
@@ -1192,10 +1201,12 @@ class BobGuardianApp(App):
         self._streamer = DockerLogStreamer(container_name)
         self._connected = False
         self._action_running = False
+        self._relaunch = False  # set by a successful self-update that changed this file
         self._events_only = False  # default: show every line, like the classic logs
         # sync state — node tick comes from the live log (freshest), ref from RPC
         self._node_tick: int | None = None
         self._ref_tick: int | None = None
+        self._initial_tick: int | None = None
         self._epoch: int | None = None
         self._eta_text: str | None = None
         self._pipeline: tuple[int, int, int] | None = None
@@ -1313,6 +1324,13 @@ class BobGuardianApp(App):
                 ep = status.get("currentProcessingEpoch")
                 if ep:
                     self._epoch = ep
+                # epoch's first tick: the node fetches every tick from here up to
+                # the network, so sync progress is measured against this floor —
+                # NOT against absolute tick 0 (those huge numbers make a barely
+                # started node read as ~99%).
+                init = status.get("initialTick")
+                if init:
+                    self._initial_tick = init
                 pl = (status.get("currentFetchingLogTick"), status.get("currentIndexingTick"),
                       status.get("currentVerifyLoggingTick"))
                 if all(pl):
@@ -1337,6 +1355,7 @@ class BobGuardianApp(App):
         the pre-restart values (node tick is monotonic, so without this a restart
         would never show). The next poll / log line rebuilds it."""
         self._node_tick = None
+        self._initial_tick = None
         self._epoch = None
         self._eta_text = None
         self._pipeline = None
@@ -1348,7 +1367,8 @@ class BobGuardianApp(App):
             sp = self.query_one(SyncPanel)
         except Exception:
             return
-        sp.update_sync(self._node_tick, self._ref_tick, self._epoch, self._eta_text)
+        sp.update_sync(self._node_tick, self._ref_tick, self._epoch, self._eta_text,
+                       self._initial_tick)
         sp.update_pipeline(self._node_tick, self._pipeline)
 
     def _eta(self, node_tick: int | None, ref: int | None) -> str | None:
@@ -1580,6 +1600,16 @@ class BobGuardianApp(App):
             ("seed", "New Seed", "blank = keep current", True),
             ("alias", "New Alias", "blank = keep current", False)]), _done)
 
+    @staticmethod
+    def _dashboard_sig() -> tuple[int, int] | None:
+        """(mtime_ns, size) of this running script, or None if unstatable. Used to
+        tell whether a self-update actually replaced the dashboard file on disk."""
+        try:
+            st = os.stat(os.path.abspath(__file__))
+            return (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return None
+
     @work(group="bob_action")
     async def _run_bob(self, args: list[str], *, stdin_data: str | None = None,
                        label: str | None = None) -> None:
@@ -1593,6 +1623,11 @@ class BobGuardianApp(App):
                            str(self._bob_script or os.path.join(DEFAULT_DATA_DIR, "bob.sh")))
             return
         self._action_running = True
+        # 'update' rewrites bob-guardian.py in place; remember the file's signature so
+        # we can relaunch into the new code once it finishes (the running process still
+        # holds the old code in memory until then).
+        is_update = bool(args) and args[0] == "update"
+        sig_before = self._dashboard_sig() if is_update else None
         if args and args[0] in ACTION_RESETS_SYNC:
             self._reset_sync_state()
         log.write_note(f"[{QUBIC_TEAL}]» bob.sh {markup_escape(' '.join(args))}  ",
@@ -1618,6 +1653,14 @@ class BobGuardianApp(App):
             await proc.wait()
             if proc.returncode == 0:
                 log.write_note(f"[{QUBIC_MINT}]» ", "done")
+                # Self-update finished and the dashboard file changed → relaunch into
+                # it. Exit the app cleanly first so Textual restores the terminal; the
+                # actual re-exec happens in main() once .run() returns.
+                if is_update and sig_before is not None and self._dashboard_sig() != sig_before:
+                    log.write_note(f"[{QUBIC_CYAN}]» ", "dashboard updated — relaunching…")
+                    self._relaunch = True
+                    await asyncio.sleep(1.2)  # let the user read the line before the screen resets
+                    self.exit()
             else:
                 log.write_note(f"[{QUBIC_CORAL}]» ", f"exited with code {proc.returncode}")
         except Exception as e:
@@ -1642,9 +1685,15 @@ def main() -> None:
     default_bob = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bob.sh")
     parser.add_argument("--bob-script", default=default_bob, help="Path to bob.sh for node actions")
     args = parser.parse_args()
-    BobGuardianApp(container_name=args.container, api_port=args.api_port,
-                   bob_script=args.bob_script, api_base=args.api_base,
-                   operator=args.operator).run()
+    app = BobGuardianApp(container_name=args.container, api_port=args.api_port,
+                         bob_script=args.bob_script, api_base=args.api_base,
+                         operator=args.operator)
+    app.run()
+    # A self-update that replaced this file asked us to relaunch: re-exec the same
+    # interpreter + argv so the freshly downloaded code takes over. Done here (after
+    # run() returns and the terminal is restored), never from inside the TUI.
+    if getattr(app, "_relaunch", False):
+        os.execv(sys.executable, [sys.executable, *sys.argv])
 
 
 if __name__ == "__main__":
