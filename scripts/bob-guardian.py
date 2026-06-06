@@ -202,6 +202,16 @@ def _fmt_eta(seconds: int) -> str:
     return f"~{seconds // 86400}d {(seconds % 86400) // 3600}h"
 
 
+def _mem_to_bytes(s: str) -> int:
+    """Parse a memory string ('1.85 GB', '2gb', '8192mb', '1073741824') to bytes;
+    0 if unparseable. Used to warn before set-mem shrinks below current usage."""
+    m = re.match(r"\s*([\d.]+)\s*([kmgt]?)b?\s*$", (s or "").lower())
+    if not m:
+        return 0
+    mult = {"": 1, "k": 1024, "m": 1024 ** 2, "g": 1024 ** 3, "t": 1024 ** 4}[m.group(2)]
+    return int(float(m.group(1)) * mult)
+
+
 def _bar(pct: float, width: int, color: str) -> str:
     pct = max(0.0, min(100.0, pct))
     filled = int(round(pct * width / 100))
@@ -1227,9 +1237,15 @@ class BobGuardianApp(App):
 
     def _set_conn(self) -> None:
         dot = f"[{QUBIC_MINT}]● connected[/]" if self._connected else f"[{QUBIC_CORAL}]● disconnected[/]"
-        self.query_one("#conn", Static).update(
-            f"{dot}  [{QUBIC_DIM}]container:[/] [{QUBIC_TEXT}]{self._container_name}[/]"
-        )
+        # Guard: during the real-terminal mount the #conn Static can transiently
+        # be unqueryable; an unguarded NoMatches here would kill the whole
+        # poll_node worker (= node polling stops). Skip this frame instead.
+        try:
+            self.query_one("#conn", Static).update(
+                f"{dot}  [{QUBIC_DIM}]container:[/] [{QUBIC_TEXT}]{self._container_name}[/]"
+            )
+        except Exception:
+            pass
 
     async def _container_state(self) -> tuple[str, str]:
         """Returns (markup, raw_state). raw_state in: running / exited / created / '' """
@@ -1476,25 +1492,32 @@ class BobGuardianApp(App):
         self.push_screen(HelpScreen())
 
     def action_set_mem(self) -> None:
-        # Only offered near full — raising KeyDB maxmemory otherwise is pointless.
+        # M works any time — raise KeyDB maxmemory proactively, not only when full.
+        # The NODE panel just nudges "press M" once near full (≥SET_MEM_THRESHOLD%).
         if len(self.screen_stack) > 1:
             return
-        pct = self._mem[2] if self._mem else 0.0
-        if pct < SET_MEM_THRESHOLD:
-            self.query_one(LogPanel).write_note(
-                f"[{QUBIC_CREAM}]» ",
-                f"KeyDB at {pct:.0f}% — raising maxmemory only matters near full (≥{SET_MEM_THRESHOLD}%)")
-            return
         cur_total = self._mem[1] if self._mem else "?"
+        cur_used = self._mem[0] if self._mem else "?"
 
         def _done(res: dict | None) -> None:
             if not res:
                 return
             val = (res.get("mem") or "").strip()
-            if val:
-                self._run_bob(["set-mem", val], label=f"set KeyDB maxmemory = {val}")
+            if not val:
+                return
+            label = f"set KeyDB maxmemory = {val}"
+            req_b, used_b = _mem_to_bytes(val), _mem_to_bytes(cur_used)
+            if req_b and used_b and req_b <= used_b:
+                # Shrinking to/below current usage evicts live node data (allkeys-lru).
+                self._confirm_then(
+                    "⚠ Below current usage",
+                    f"{val} is at/below current KeyDB usage ({cur_used}). "
+                    f"KeyDB will EVICT node data to fit. Continue?",
+                    lambda: self._run_bob(["set-mem", val], stdin_data="yes\n", label=label))
+            else:
+                self._run_bob(["set-mem", val], label=label)
         self.push_screen(InputDialog("Set KeyDB maxmemory", [
-            ("mem", f"New limit (current total {cur_total})", "e.g. 12gb", False)]), _done)
+            ("mem", f"New limit (used {cur_used} / total {cur_total})", "e.g. 12gb", False)]), _done)
 
     # ─── bob.sh actions ───────────────────────────────────────────────────────
     def _bob_path(self) -> str | None:
