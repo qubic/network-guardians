@@ -113,6 +113,8 @@ from textual.message import Message  # noqa: E402
 from textual.screen import ModalScreen  # noqa: E402
 from textual.widgets import Button, Footer, Header, Input, RichLog, Static  # noqa: E402
 from rich.markup import escape as markup_escape  # noqa: E402
+from rich.text import Text  # noqa: E402
+from rich.highlighter import ReprHighlighter  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -334,8 +336,8 @@ class DockerLogStreamer:
 
 # the cryptic qubic stdout prefix: "260529115731 000:000(485).54778313.215 "
 RE_QPREFIX = re.compile(r"^\d{12}\s+\d{3}:\d{3}\(\d{3}\)\.[\d']+\.\d+\s*")
-# pull the live tick.epoch out of that prefix (the freshest tick the node is on)
-RE_QTICK = re.compile(r"^\d{12}\s+\d{3}:\d{3}\(\d{3}\)\.([\d']+)\.(\d+)")
+# pull votes + live tick.epoch out of that prefix (the freshest tick the node is on)
+RE_QTICK = re.compile(r"^\d{12}\s+(\d{3}:\d{3}\(\d{3}\))\.([\d']+)\.(\d+)")
 # the per-tick connection/peer line: "[+2'580 -0 *3'066 /17'885] 148|37 72/0/251 ..."
 RE_CONN = re.compile(r"^\[[+-][\d']+\s+[+-][\d']+\s+\*([\d']+)\s+/([\d']+)\]\s+([\d']+)\|([\d']+)")
 # pure per-tick performance spam — hidden unless raw-log mode is on
@@ -354,7 +356,7 @@ def _num(s: str) -> int:
 
 
 class LogLine:
-    __slots__ = ("ts", "level", "text", "noise", "conns", "peers", "tick", "epoch")
+    __slots__ = ("ts", "level", "text", "noise", "conns", "peers", "tick", "epoch", "qtag")
 
     def __init__(self, ts: str, level: str, text: str) -> None:
         self.ts = ts
@@ -365,6 +367,7 @@ class LogLine:
         self.peers: tuple[int, int] | None = None
         self.tick: int | None = None
         self.epoch: int | None = None
+        self.qtag: str | None = None  # compact "votes tick" tag from the qubic prefix
         m = RE_CONN.match(text)
         if m:
             self.conns = (_num(m.group(1)), _num(m.group(2)))   # active, total
@@ -392,9 +395,28 @@ def parse_log(line: str) -> LogLine | None:
     msg = RE_QPREFIX.sub("", msg)          # drop the cryptic numeric prefix
     entry = LogLine(ts, data.get("level", ""), msg)
     if mt:
-        entry.tick = _num(mt.group(1))
-        entry.epoch = int(mt.group(2))
+        entry.qtag = f"{mt.group(1)} {mt.group(2)}"   # e.g. "000:000(546) 57'830'644"
+        entry.tick = _num(mt.group(2))
+        entry.epoch = int(mt.group(3))
     return entry
+
+
+_LOG_HIGHLIGHTER = ReprHighlighter()
+
+
+def format_log_markup(entry: LogLine) -> Text:
+    """Render a parsed log line: dim timestamp, green votes/tick tag, coloured text.
+    Built as a Text object so RichLog's auto-highlighter cannot recolour the tag
+    (it restyles every number cyan, which used to swallow the qtag colour)."""
+    line = Text()
+    if entry.ts:
+        line.append(entry.ts + " ", style=QUBIC_DIM)
+    if entry.qtag:
+        line.append(entry.qtag + " ", style="#3fb950")  # green: votes + current tick
+    body = Text(entry.text, style=LEVEL_COLORS.get(entry.level, ""))
+    _LOG_HIGHLIGHTER.highlight(body)  # keep the usual number highlighting in the message
+    line.append_text(body)
+    return line
 
 
 # ─── Panels ──────────────────────────────────────────────────────────────────────
@@ -816,11 +838,8 @@ class LogPanel(Static):
     def set_mode(self, events_only: bool) -> None:
         self.border_title = " LOG · events " if events_only else " LOG · full "
 
-    def write_log(self, ts: str, level: str, message: str) -> None:
-        log = self.query_one("#log-output", RichLog)
-        safe = markup_escape(message)
-        color = LEVEL_COLORS.get(level, "")
-        log.write(f"[{QUBIC_DIM}]{ts}[/] [{color}]{safe}[/]" if ts else f"[{color}]{safe}[/]")
+    def write_entry(self, entry: LogLine) -> None:
+        self.query_one("#log-output", RichLog).write(format_log_markup(entry))
 
     def write_note(self, prefix_markup: str, text: str) -> None:
         self.query_one("#log-output", RichLog).write(f"{prefix_markup}{markup_escape(text)}")
@@ -1008,9 +1027,7 @@ class LogScreen(ModalScreen[None]):
                     continue
                 if self._events_only and entry.noise:
                     continue
-                safe = markup_escape(entry.text)
-                color = LEVEL_COLORS.get(entry.level, "")
-                rl.write(f"[{QUBIC_DIM}]{entry.ts}[/] [{color}]{safe}[/]" if entry.ts else f"[{color}]{safe}[/]")
+                rl.write(format_log_markup(entry))
         except asyncio.CancelledError:
             pass
 
@@ -1094,9 +1111,7 @@ class LogCopyScreen(ModalScreen[None]):
                 continue
             if self._events_only and entry.noise:
                 continue
-            safe = markup_escape(entry.text)
-            color = LEVEL_COLORS.get(entry.level, "")
-            rl.write(f"[{QUBIC_DIM}]{entry.ts}[/] [{color}]{safe}[/]" if entry.ts else f"[{color}]{safe}[/]")
+            rl.write(format_log_markup(entry))
         rl.scroll_end(animate=False)
         rl.focus()
 
@@ -1377,7 +1392,7 @@ class GuardianApp(App):
                 # show every line by default; only hide per-tick spam if asked
                 if self._events_only and entry.noise:
                     continue
-                log_panel.write_log(entry.ts, entry.level, entry.text)
+                log_panel.write_entry(entry)
         except asyncio.CancelledError:
             pass
         except Exception as e:
