@@ -496,7 +496,8 @@ class SyncPanel(_RowPanel):
     ]
 
     def update_sync(self, node_tick: int | None, ref_tick: int | None,
-                    epoch: int | None, eta_text: str | None) -> None:
+                    epoch: int | None, eta_text: str | None,
+                    initial_tick: int | None = None) -> None:
         self.set_row("sy-epoch", "Epoch", f"[{QUBIC_TEXT}]{epoch or '-'}[/]")
         self.set_row("sy-node", "Node Tick", f"[bold {QUBIC_CYAN}]{_fmt_tick(node_tick)}[/]")
         self.set_row("sy-ref", "Net Tick", f"[{QUBIC_TEXT}]{_fmt_tick(ref_tick)}[/]")
@@ -525,7 +526,13 @@ class SyncPanel(_RowPanel):
             self.set_row("sy-state", "State", f"[{QUBIC_CREAM}]● SYNCING[/]")
             self.set_row("sy-behind", "Behind", f"[{QUBIC_CORAL}]{_fmt_tick(behind)}[/] ticks")
             self.set_row("sy-eta", "ETA", f"[{QUBIC_CYAN}]{eta_text or 'warming up…'}[/]")
-            pct = 100.0 * node_tick / ref_tick if ref_tick else 0
+            # progress within the current epoch (sync replays from initialTick),
+            # not node_tick/ref_tick — absolute ticks always read ~99.x%
+            if initial_tick and ref_tick > initial_tick:
+                pct = 100.0 * max(0, node_tick - initial_tick) / (ref_tick - initial_tick)
+            else:
+                pct = 100.0 * node_tick / ref_tick if ref_tick else 0
+            pct = min(pct, 99.99)
             self.set_line("sy-bar", f"[{QUBIC_LABEL}]{'Sync':<{self.LABEL_W}}[/] {_bar(pct, 30, QUBIC_CYAN)} {pct:.2f}%")
 
     def update_snapshot(self, snap: dict) -> None:
@@ -1147,6 +1154,7 @@ class GuardianApp(App):
         self._events_only = False  # default: show every line, like the classic logs
         # sync state — node tick comes from the live log (freshest), ref from RPC
         self._node_tick: int | None = None
+        self._initial_tick: int | None = None
         self._ref_tick: int | None = None
         self._epoch: int | None = None
         self._eta_text: str | None = None
@@ -1247,6 +1255,8 @@ class GuardianApp(App):
                 self._node_tick = polled_tick
             if polled_epoch:
                 self._epoch = polled_epoch
+            if tick and tick.get("initialTick"):
+                self._initial_tick = tick["initialTick"]
 
             self._ref_tick = await fetch_network_reference()
             self._eta_text = self._eta(self._node_tick, self._ref_tick)
@@ -1259,6 +1269,7 @@ class GuardianApp(App):
         the pre-restart values (node tick is monotonic, so without this a restart
         would never show). The next poll / log line rebuilds it."""
         self._node_tick = None
+        self._initial_tick = None
         self._epoch = None
         self._eta_text = None
         self._behind_hist.clear()
@@ -1275,7 +1286,8 @@ class GuardianApp(App):
         if self._snap and not self._node_tick:
             sp.update_snapshot(self._snap)
         else:
-            sp.update_sync(self._node_tick, self._ref_tick, self._epoch, self._eta_text)
+            sp.update_sync(self._node_tick, self._ref_tick, self._epoch, self._eta_text,
+                           self._initial_tick)
 
     def _eta(self, node_tick: int | None, ref: int | None) -> str | None:
         if not node_tick or not ref:
