@@ -211,6 +211,34 @@ stop_and_wipe() {
     fi
 }
 
+# Confirm the node container actually reached (and held) a running state after a
+# start/restart/reset. `docker compose up -d` returns 0 as soon as the container
+# is created, but one that crashes on boot (port clash, bad config, data wiped
+# mid-write) flips to Exited a moment later. The old code printed success
+# regardless — and from the classic menu (which runs with `set +e`) that left an
+# operator staring at "reset complete" over a dead node. Poll until it's up, then
+# re-check after a beat so a boot-crash loop doesn't read as healthy. On failure
+# surface the real state + last log lines and return non-zero.
+verify_running() {
+    local i
+    for i in $(seq 1 8); do
+        container_running && break
+        sleep 1
+    done
+    if container_running; then
+        sleep 2
+        container_running && return 0
+    fi
+    log_error "Container '${CONTAINER_NAME}' is not running after start"
+    local state
+    state=$(docker ps -a --filter "name=^${CONTAINER_NAME}$" --format '{{.Status}}' 2>/dev/null)
+    [ -n "$state" ] && log_warn "State: ${state}"
+    log_warn "Recent logs:"
+    docker logs --tail 20 "$CONTAINER_NAME" 2>&1 | sed 's/^/    /' || true
+    log_warn "Retry with: cd ${DATA_DIR} && docker compose up -d"
+    return 1
+}
+
 do_install() {
     log_info "Installing Bob node..."
 
@@ -289,6 +317,7 @@ EOF
     # Start containers
     log_info "Starting containers..."
     cd "${DATA_DIR}" && docker compose up -d
+    verify_running || return 1
 
     log_ok "Bob node started!"
     echo ""
@@ -508,9 +537,11 @@ do_start() {
 
     if [ -f "${DATA_DIR}/docker-compose.yml" ]; then
         cd "${DATA_DIR}" && docker compose up -d
+        verify_running || return 1
         log_ok "Started"
     elif container_exists; then
         docker start "$CONTAINER_NAME"
+        verify_running || return 1
         log_ok "Started"
     else
         log_error "Container not found. Run: $0 install"
@@ -521,9 +552,11 @@ do_start() {
 do_restart() {
     if [ -f "${DATA_DIR}/docker-compose.yml" ]; then
         cd "${DATA_DIR}" && docker compose up -d --force-recreate
+        verify_running || return 1
         log_ok "Restarted"
     elif container_exists; then
         docker restart "$CONTAINER_NAME"
+        verify_running || return 1
         log_ok "Restarted"
     else
         log_error "Container not found. Run: $0 install"
@@ -572,6 +605,7 @@ EOF
     log_info "Restarting with fresh data..."
     stop_and_wipe
     cd "${DATA_DIR}" && docker compose up -d
+    verify_running || return 1
     log_ok "Reconfigured and restarted!"
 }
 
@@ -593,6 +627,7 @@ do_reset() {
     log_info "Wiping data and restarting..."
     stop_and_wipe
     cd "${DATA_DIR}" && docker compose up -d
+    verify_running || return 1
     log_ok "Node reset complete! Starting with fresh state."
 }
 
