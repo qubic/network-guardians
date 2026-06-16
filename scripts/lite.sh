@@ -624,24 +624,42 @@ do_logs() {
     docker logs --tail 100 -f "$CONTAINER_NAME"
 }
 
+# Stop the compose stack, giving the node enough time to shut down cleanly.
+#
+# The in-container orchestrator already does the right thing on SIGTERM: it sends
+# the binary a graceful /shutdown and WAITS (up to ~150s) for it to persist tick
+# storage and exit. The only bug was that `docker compose down` defaults to a 10s
+# grace, so it SIGKILLed the binary mid-save -> corrupt state ("Invalid meta data
+# file for tick storage") -> full resync. So we simply give docker a long enough
+# --timeout. We do NOT send F8/ESC ourselves and do NOT poll `is_saving_snapshot`
+# (that flag does NOT track the tick-storage save — only source-mode snapshots —
+# so polling it returns instantly and cuts the save off).
+#
+# A ticking node gets the long timeout; a node still downloading a snapshot has
+# nothing to save (and can't react to SIGTERM until the download ends) so it gets
+# a short one to avoid a pointless multi-minute wait.
+node_compose_down() {
+    local to=20
+    if docker exec "$CONTAINER_NAME" orchestrator-ctl status 2>/dev/null \
+         | grep -q '"is_saving_snapshot"'; then
+        to=180
+        log_info "Stopping node gracefully (up to ${to}s for a clean state save)..."
+    else
+        log_info "Stopping node (not ticking, nothing to save)..."
+    fi
+    cd "${DATA_DIR}" && docker compose down --timeout "$to"
+}
+
 do_stop() {
     if ! container_running; then
         log_info "Already stopped"
         return
     fi
 
-    # Graceful shutdown: send ESC to Qubic process first
-    log_info "Sending ESC to Qubic process..."
-    docker exec "$CONTAINER_NAME" orchestrator-ctl send-key esc &>/dev/null && \
-        log_ok "ESC sent" || log_warn "Could not send ESC (continuing anyway)"
-
-    log_info "Waiting 30s for graceful shutdown..."
-    sleep 30
-
     if [ -f "${DATA_DIR}/docker-compose.yml" ]; then
-        cd "${DATA_DIR}" && docker compose down
+        node_compose_down
     else
-        docker stop "$CONTAINER_NAME"
+        docker stop --time 180 "$CONTAINER_NAME"
     fi
     log_ok "Stopped"
 }
@@ -666,7 +684,7 @@ do_start() {
 
 do_restart() {
     if [ -f "${DATA_DIR}/docker-compose.yml" ]; then
-        cd "${DATA_DIR}" && docker compose down && docker compose up -d
+        node_compose_down && docker compose up -d
         log_ok "Restarted"
     elif container_exists; then
         docker restart "$CONTAINER_NAME"
@@ -714,9 +732,11 @@ EOF
     chmod 600 "${DATA_DIR}/.env"
     log_ok "Config updated"
 
-    # Restart with volume reset
-    log_info "Restarting with fresh data..."
-    cd "${DATA_DIR}" && docker compose down -v && docker compose up -d
+    # Restart to apply the new identity. KEEP the volume — changing the operator
+    # seed/alias does NOT invalidate the synced chain state (tick storage is
+    # network-wide, not identity-bound), so reusing it avoids a full resync.
+    log_info "Restarting to apply new config (keeping synced data)..."
+    node_compose_down && docker compose up -d
     log_ok "Reconfigured and restarted!"
 }
 
@@ -805,22 +825,8 @@ do_deploy() {
         return 1
     fi
 
-    # Graceful stop: F8 (snapshot) -> ESC (shutdown)
-    if container_running; then
-        log_info "Triggering snapshot (F8)..."
-        docker exec "$CONTAINER_NAME" orchestrator-ctl send-key f8 &>/dev/null && \
-            log_ok "Snapshot triggered" || log_warn "Could not trigger snapshot (continuing anyway)"
-        log_info "Waiting 30s for snapshot to complete..."
-        sleep 30
-
-        log_info "Sending ESC to Qubic process..."
-        docker exec "$CONTAINER_NAME" orchestrator-ctl send-key esc &>/dev/null && \
-            log_ok "ESC sent" || log_warn "Could not send ESC (continuing anyway)"
-        log_info "Waiting 30s for graceful shutdown..."
-        sleep 30
-    fi
-
-    cd "${DATA_DIR}" && docker compose down && docker compose up -d
+    # Graceful stop (give the node time to persist state) before recreating
+    node_compose_down && docker compose up -d
 
     log_ok "Deployed ${DOCKER_IMAGE}:${tag} (watchtower will auto-update digest changes within this tag)"
 }
